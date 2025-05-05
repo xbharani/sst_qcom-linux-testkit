@@ -10,9 +10,7 @@ log_info "----------------------------------------------------------------------
 log_info "-------------------Starting $TESTNAME Testcase----------------------------"
 
 log_info "Checking if dependency binary is available"
-check_dependencies a660_sqe.fw 
-check_dependencies a660_zap.mbn 
-check_dependencies a660_gmu.bin
+check_dependencies a660_sqe.fw a660_zap.mbn a660_gmu.bin
 
 # Clear dmesg logs
 dmesg -c
