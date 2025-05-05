@@ -9,6 +9,8 @@ test_bin_path=$(find_test_case_bin_by_name "lat_mem_rd")
 log_info "-----------------------------------------------------------------------------------------"
 log_info "-------------------Starting $TESTNAME Testcase----------------------------"
 
+log_info "Checking if dependency binary is available"
+check_dependencies lat_mem_rd
 
 extract_votes() {
   cat /sys/kernel/debug/interconnect/interconnect_summary | grep -i cpu | awk '{print $NF}'

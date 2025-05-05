@@ -32,6 +32,21 @@ find_test_case_script_by_name() {
     find $__RUNNER_UTILS_BIN_DIR -type d -iname "$test_name" 2>/dev/null
 }
 
+check_dependencies() {
+    local missing=0
+    for cmd in "$@"; do
+        if ! command -v "$cmd" &>/dev/null; then
+            log_error "ERROR: Required command '$cmd' not found in PATH."
+            missing=1
+        fi
+    done
+    if [ "$missing" -ne 0 ]; then
+        log_error "Exiting due to missing dependencies."
+        exit 1
+    else
+	log_pass "Test related dependencies are present."
+    fi
+}
 
 # Logging levels
 log_info() { log "INFO" "$@"; }

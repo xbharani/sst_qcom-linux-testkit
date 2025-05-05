@@ -9,15 +9,15 @@ test_path=$(find_test_case_by_name "$TESTNAME")
 log_info "-----------------------------------------------------------------------------------------"
 log_info "-------------------Starting $TESTNAME Testcase----------------------------"
 
-chmod -R 777 /rngtest
-
-cd /rngtest
+log_info "Checking if dependency binary is available"
+check_dependencies rngtest
 
 cat /dev/random | rngtest -c 1000 > /tmp/rngtest_output.txt
 
 grep 'count of bits' /tmp/rngtest_output.txt | awk '{print $NF}' > /tmp/rngtest_value.txt
 
 value=$(cat /tmp/rngtest_value.txt)
+
 
 if [ "$value" -lt 10 ]; then
     log_pass "$TESTNAME : Test Passed"
