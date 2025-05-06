@@ -9,8 +9,11 @@ test_path=$(find_test_case_by_name "$TESTNAME")
 log_info "-----------------------------------------------------------------------------------------"
 log_info "-------------------Starting $TESTNAME Testcase----------------------------"
 
+log_info "Checking if dependency binary is available"
+check_dependencies i2c-msm-test
+
 log_info "running i2c binary"
-output=$(/var/common/bins/buses/i2c-msm-test -v -D /dev/i2c-0 -l | grep "ret:1")
+output=$(i2c-msm-test -v -D /dev/i2c-0 -l | grep "ret:1")
 
 
 if echo "$output" | grep -q "Reading"; then

@@ -9,13 +9,10 @@ test_path=$(find_test_case_by_name "$TESTNAME")
 log_info "--------------------------------------------------------------------------"
 log_info "-------------------Starting $TESTNAME Testcase----------------------------"
 
-# Make the test executable
-chmod -R 777 /DSP_audioPD
+log_info "Checking if dependency binary is available"
+check_dependencies adsprpcd
 
-export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/DSP_audioPD/libs/
-
-cd /DSP_audioPD/bins/
-./adsprpcd &
+adsprpcd &
 PID = $!
 
 if [ -z "$PID" ]; then

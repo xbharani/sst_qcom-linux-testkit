@@ -9,11 +9,8 @@ test_path=$(find_test_case_by_name "$TESTNAME")
 log_info "-----------------------------------------------------------------------------------------"
 log_info "-------------------Starting $TESTNAME Testcase----------------------------"
 
-cd /Graphics
-
-cp -r a660_sqe.fw /lib/firmware/
-cp -r a660_zap.mbn /lib/firmware/qcom/qcs6490/
-cp -r a660_gmu.bin /lib/firmware/
+log_info "Checking if dependency binary is available"
+check_dependencies a660_sqe.fw a660_zap.mbn a660_gmu.bin
 
 # Clear dmesg logs
 dmesg -c
