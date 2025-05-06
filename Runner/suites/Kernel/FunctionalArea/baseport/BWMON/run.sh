@@ -9,6 +9,9 @@ test_path=$(find_test_case_by_name "$TESTNAME")
 log_info "--------------------------------------------------------------------------"
 log_info "-------------------Starting $TESTNAME Testcase----------------------------"
 
+log_info "Checking if dependency binary is available"
+check_dependencies bw_mem
+
 log_info "Fetching te interconnect summary"
 extract_votes() {
   cat /sys/kernel/debug/interconnect/interconnect_summary | grep -i pmu | awk '{print $NF}'
@@ -21,7 +24,7 @@ log_info "$initial_votes"
 log_info "$initial_votes"
 
 log_info "Running bw_mem tool..." 
-/var/common/bins/bw_mem 4000000000 frd &
+bw_mem 4000000000 frd &
 
 sleep 2
 

@@ -9,11 +9,10 @@ test_path=$(find_test_case_by_name "$TESTNAME")
 log_info "-----------------------------------------------------------------------------------------"
 log_info "-------------------Starting $TESTNAME Testcase----------------------------"
 
-cp -r /kcapi/kcapi-convience /usr/bin/
+log_info "Checking if dependency binary is available"
+check_dependencies kcapi-convience
 
-chmod 777 /usr/bin/kcapi-convience
-
-/usr/bin/kcapi-convience
+kcapi-convience
 
 echo $?
 
