@@ -91,15 +91,6 @@ Sample integration flow:
 
 ---
 
-Contributions
-
-Contributions to add more validations, improve robustness, or extend for more platforms are welcome!
-
-Please make sure to sign your commits:
-```
-git commit -s -m "your commit message"
-```
-
 Maintainers
 
 Qualcomm - Initial framework
