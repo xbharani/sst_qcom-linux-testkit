@@ -3,9 +3,6 @@
 # Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 # SPDX-License-Identifier: BSD-3-Clause-Clear
 
-# Suppress 'Broken pipe' errors globally in this shell (put this at the very top once)
-trap '' PIPE
-
 # --- Logging helpers ---
 log() {
     level=$1
@@ -559,3 +556,459 @@ EOF
     rm -f "$safe_dhcp_script"
     return 0
 }
+
+# Remove paired BT device by MAC
+bt_cleanup_paired_device() {
+    mac="$1"
+    expect <<EOF > /dev/null 2>&1
+log_user 0
+spawn bluetoothctl
+expect "#" { send "remove $mac\r" }
+expect "#" { send "quit\r" }
+EOF
+}
+
+# Retry a shell command N times with sleep
+retry_command_bt() {
+    cmd="$1"
+    msg="$2"
+    max="${3:-3}"
+    count=1
+    while [ "$count" -le "$max" ]; do
+        if eval "$cmd"; then
+            return 0
+        fi
+        log_warn "Retry $count/$max failed: $msg"
+        count=$((count + 1))
+        sleep 2
+    done
+    return 1
+}
+
+# Check if a device (MAC or Name) is in the whitelist
+bt_in_whitelist() {
+    device_name="$1"
+    device_mac="$2"
+
+    whitelist_value="${WHITELIST:-}"
+    log_info "Checking if MAC='$device_mac' or NAME='$device_name' is in whitelist: '$whitelist_value'"
+
+    echo "$whitelist_value" | tr -s ' ' '\n' | while IFS= read -r allowed; do
+        if [ "$allowed" = "$device_mac" ] || [ "$allowed" = "$device_name" ]; then
+            log_info "MAC or NAME matched and allowed: $allowed"
+            return 0
+        fi
+    done
+
+    log_info "MAC matched but neither MAC nor NAME in whitelist"
+    return 1
+}
+# bt_parse_whitelist <whitelist_file>
+# Reads a whitelist file where each line has:
+bt_parse_whitelist() {
+    WHITELIST_ENTRIES=""
+    if [ -n "$1" ] && [ -f "$1" ]; then
+        while IFS= read -r line || [ -n "$line" ]; do
+            case "$line" in
+                ""|\#*) continue ;;  # Skip blank lines and comments
+                *) WHITELIST_ENTRIES="${WHITELIST_ENTRIES}${line}
+" ;;
+            esac
+        done < "$1"
+    fi
+}
+
+# bt_in_whitelist <mac> <name>
+# Checks if a given device (MAC and optional name) exists
+# Returns:
+#     0 (success) if found
+#     1 (failure) if not found
+bt_in_whitelist() {
+    mac="$1"
+    name="$2"
+
+    echo "$WHITELIST_ENTRIES" | while IFS= read -r entry || [ -n "$entry" ]; do
+        entry_mac=$(echo "$entry" | awk '{print $1}')
+        entry_name=$(echo "$entry" | cut -d' ' -f2-)
+        if [ "$mac" = "$entry_mac" ] && { [ -z "$entry_name" ] || [ "$name" = "$entry_name" ]; }; then
+            exit 0
+        fi
+    done
+
+    return 1
+}
+
+# bt_scan_devices
+# Attempts to detect nearby Bluetooth devices using:
+#   1. hcitool scan
+#   2. fallback: bluetoothctl scan (via expect)
+# Returns:
+#   0 - if devices found
+#   1 - if no devices found or error
+bt_scan_devices() {
+    timestamp=$(date '+%Y%m%d_%H%M%S')
+    scan_log="scan_${timestamp}.log"
+    found_log="found_devices_${timestamp}.log"
+    : > "$scan_log"
+    : > "$found_log"
+
+    log_info "Detecting Bluetooth adapter..."
+    hcidev=$(hciconfig | awk '/^hci/ { print $1 }' | head -n1)
+    if [ -z "$hcidev" ]; then
+        log_error "No Bluetooth adapter found"
+        return 1
+    fi
+
+    log_info "Using Bluetooth adapter: $hcidev"
+    hciconfig "$hcidev" up
+
+    log_info "Running Bluetooth scan via hcitool..."
+    if hcitool -i "$hcidev" scan > hcitool_scan.tmp 2>/dev/null; then
+        tail -n +2 hcitool_scan.tmp | awk '{ printf "%s %s\n", $1, $2}' > "$found_log"
+        rm -f hcitool_scan.tmp
+        [ -s "$found_log" ] && return 0
+    fi
+
+    log_warn "hcitool scan returned nothing. Falling back to bluetoothctl scan..."
+    expect <<EOF > "$scan_log"
+log_user 0
+spawn bluetoothctl
+expect "#" { send "power on\r" }
+expect "#" { send "agent NoInputNoOutput\r" }
+expect "#" { send "default-agent\r" }
+expect "#" { send "scan on\r" }
+sleep 10
+send "scan off\r"
+expect "#" { send "quit\r" }
+EOF
+
+    grep -E "^\s*\[NEW\] Device" "$scan_log" | awk '{ print $4, substr($0, index($0, $5)) }' > "$found_log"
+    if [ ! -s "$found_log" ]; then
+        log_warn "Scan log is empty. Possible issue with bluetoothctl or adapter."
+        return 1
+    fi
+
+    return 0
+}
+
+# Pair with Bluetooth device using MAC (with retries and timestamped logs)
+bt_pair_with_mac() {
+    bt_mac="$1"
+    max_retries=3
+    retry=1
+
+    while [ "$retry" -le "$max_retries" ]; do
+        log_info "Attempt $retry: Pairing with $bt_mac using bluetoothctl"
+
+        timestamp=$(date '+%Y%m%d_%H%M%S')
+        sanitized_mac=$(echo "$bt_mac" | sed 's/:/_/g')
+        logfile="pairing_attempt_${sanitized_mac}_${timestamp}.log"
+
+        expect <<EOF | tee -a "$logfile"
+log_user 1
+set timeout 30
+
+spawn bluetoothctl
+expect {
+    -re {.*[#>]} { send "power on\r" }
+}
+expect {
+    -re {.*[#>]} { send "remove $bt_mac\r" }
+}
+expect {
+    -re {.*[#>]} { send "scan on\r" }
+}
+sleep 5
+expect {
+    -re {.*[#>]} { send "scan off\r" }
+}
+expect {
+    -re {.*[#>]} { send "agent KeyboardOnly\r" }
+}
+expect {
+    -re {.*[#>]} { send "default-agent\r" }
+}
+expect {
+    -re {.*[#>]} { send "pair $bt_mac\r" }
+}
+expect {
+    -re {.*Confirm passkey.*yes/no.*} {
+        send "yes\r"
+        exp_continue
+    }
+    -re {.*Paired: yes.*} {
+        send "quit\r"
+        exit 0
+    }
+    -re {.*Pairing successful.*} {
+        send "quit\r"
+        exit 0
+    }
+    -re {.*Failed to pair.*} {
+        send "quit\r"
+        exit 1
+    }
+    -re {.*Device $bt_mac not available.*} {
+        send "quit\r"
+        exit 2
+    }
+    timeout {
+        send "quit\r"
+        exit 3
+    }
+}
+EOF
+
+        result=$?
+        case "$result" in
+            0)
+                log_pass "Pairing successful with $bt_mac"
+                return 0
+                ;;
+            1|3)
+                log_warn "Pairing attempt $retry failed for $bt_mac. Retrying after unpairing again..."
+                bt_cleanup_paired_device "$bt_mac"
+                ;;
+            2)
+                log_warn "Device $bt_mac not available. Check proximity and power."
+                ;;
+            *)
+                log_warn "Unexpected pairing error code: $result"
+                ;;
+        esac
+
+        retry=$((retry + 1))
+        sleep 2
+    done
+
+    log_fail "Pairing failed after $max_retries attempts for $bt_mac"
+    return 1
+}
+
+# Post-pairing connection test with bluetoothctl and l2ping fallback
+bt_post_pair_connect() {
+    target_mac="$1"
+    sanitized_mac=$(echo "$target_mac" | tr ':' '_')
+    timestamp=$(date '+%Y%m%d_%H%M%S')
+    base_logfile="bt_connect_${sanitized_mac}_${timestamp}"
+    max_attempts=3
+    attempt=1
+
+    if bluetoothctl info "$target_mac" | grep -q "Connected: yes"; then
+        log_info "Device $target_mac is already connected, skipping explicit connect"
+        log_pass "Post-pair connection successful"
+        return 0
+    fi
+
+    while [ "$attempt" -le "$max_attempts" ]; do
+        log_info "Attempting to connect post-pair (try $attempt): $target_mac"
+        logfile="${base_logfile}_attempt${attempt}.log"
+
+        expect <<EOF >"$logfile" 2>&1
+log_user 0
+set timeout 10
+spawn bluetoothctl
+expect {
+    -re ".*#.*" {}
+}
+send "connect $target_mac\r"
+expect {
+    -re "Connection successful" { exit 0 }
+    -re "Failed to connect|Device not available" { exit 1 }
+    timeout { exit 1 }
+}
+EOF
+        result=$?
+        if [ "$result" -eq 0 ]; then
+            log_pass "Post-pair connection successful"
+            return 0
+        fi
+        log_warn "Connect attempt $attempt failed (check $logfile)"
+        attempt=$((attempt + 1))
+        sleep 2
+    done
+
+    log_info "Falling back to l2ping to trigger Bluetooth link with $target_mac"
+    if command -v l2ping >/dev/null 2>&1; then
+        if l2ping -c 3 -t 5 "$target_mac" >>"${base_logfile}_l2ping.log" 2>&1; then
+            if bluetoothctl info "$target_mac" | grep -q "Connected: yes"; then
+                log_pass "Fallback l2ping worked - device is now connected"
+                return 0
+            fi
+        else
+            log_warn "l2ping failed or no response"
+        fi
+    else
+        log_warn "l2ping not available - skipping fallback"
+    fi
+
+    log_fail "Post-pair connection failed for $target_mac"
+    return 1
+}
+# Find MAC address from device name in scan log
+bt_find_mac_by_name() {
+    target="$1"
+    log="$2"
+    grep -i "$target" "$log" | awk '{print $3}' | head -n1
+}
+
+# Scan and pair (dynamic adapter, timestamped logs)
+bt_scan_and_pair() {
+    target_name="$1"
+    target_mac="$2"
+    scan_attempts=3
+    found=0
+    timestamp=$(date '+%Y%m%d_%H%M%S')
+    scan_log="scan_${timestamp}.log"
+    found_log="found_devices_${timestamp}.log"
+    : > "$scan_log"
+    : > "$found_log"
+
+    log_info "Detecting Bluetooth adapter..."
+    hcidev=$(hciconfig | awk '/^hci/ { print $1 }' | head -n1)
+    if [ -z "$hcidev" ]; then
+        log_error "No Bluetooth adapter found"
+        return 1
+    fi
+    log_info "Using Bluetooth adapter: $hcidev"
+    hciconfig "$hcidev" up
+
+    log_info "Checking for connected devices..."
+    for mac in $(bluetoothctl paired-devices | awk '{print $2}'); do
+        if bluetoothctl info "$mac" | grep -q "Connected: yes"; then
+            log_info "Disconnecting $mac..."
+            bluetoothctl disconnect "$mac" >/dev/null 2>&1
+        fi
+    done
+
+    i=1
+    while [ "$i" -le "$scan_attempts" ]; do
+        log_info "Scan attempt $i of $scan_attempts..."
+        expect <<EOF > "$scan_log"
+log_user 0
+spawn bluetoothctl
+expect "#" { send "power on\r" }
+expect "#" { send "agent NoInputNoOutput\r" }
+expect "#" { send "default-agent\r" }
+expect "#" { send "scan on\r" }
+sleep 20
+send "scan off\r"
+expect "#" { send "quit\r" }
+EOF
+
+        grep -iE 'Device ([0-9A-F]{2}:){5}[0-9A-F]{2}' "$scan_log" | awk '{print $2, $3}' > "$found_log"
+
+        if grep -q "$target_mac" "$found_log"; then
+            found=1
+            break
+        fi
+        i=$((i + 1))
+    done
+
+    if [ "$found" -ne 1 ]; then
+        log_warn "Device $target_mac ($target_name) not found after $scan_attempts attempts"
+        return 1
+    fi
+
+    log_info "Device $target_mac found. Proceeding to pair..."
+
+    if bluetoothctl paired-devices | grep -q "$target_mac"; then
+        log_info "Device $target_mac is already paired. Unpairing..."
+        bluetoothctl remove "$target_mac" >/dev/null 2>&1
+        sleep 1
+    fi
+
+    i=1
+    while [ "$i" -le 3 ]; do
+        log_info "Pairing attempt $i..."
+        if expect <<EOF
+log_user 1
+spawn bluetoothctl
+expect "#" { send "agent KeyboardOnly\r" }
+expect "#" { send "default-agent\r" }
+expect "#" { send "pair $target_mac\r" }
+expect {
+    "Pairing successful" { send "quit\r"; exit 0 }
+    "Failed to pair" { send "quit\r"; exit 1 }
+    timeout { exit 1 }
+}
+EOF
+        then
+            log_pass "Pairing successful with $target_mac"
+            return 0
+        fi
+        log_warn "Pairing failed attempt $i/3..."
+        i=$((i + 1))
+        sleep 1
+    done
+
+    log_fail "Pairing failed after 3 attempts"
+    return 1
+}
+
+# Select Bluetooth target device from scanned results based on name and/or MAC and whitelist
+select_bt_target_device() {
+    found_log="$1"
+    bt_name="$2"
+    bt_mac="$3"
+    whitelist="$4"
+    result_mac=""
+
+    while IFS= read -r line; do
+        mac=$(echo "$line" | awk '{ print $1 }')
+        name=$(echo "$line" | cut -d' ' -f2-)
+
+        log_info "Parsed: MAC=$mac NAME=$name"
+
+        if [ -n "$whitelist" ]; then
+            log_info "Debug: WHITELIST entry='$whitelist'"
+            if [ "$mac" != "$whitelist" ]; then
+                continue
+            fi
+        fi
+
+        if [ -n "$bt_mac" ]; then
+            if [ "$mac" = "$bt_mac" ]; then
+                log_info "MAC matched WHITELIST and target: $mac"
+                result_mac="$mac"
+                break
+            fi
+        elif [ "$name" = "$bt_name" ]; then
+            log_info "Name match found and MAC in whitelist: $name ($mac)"
+            result_mac="$mac"
+            break
+        fi
+    done < "$found_log"
+
+    [ -n "$result_mac" ] && echo "$result_mac" && return 0
+    return 1
+}
+
+bt_remove_all_paired_devices() {
+    log_info "Removing all previously paired Bluetooth devices..."
+    bluetoothctl paired-devices | awk '/Device/ {print $2}' | while read -r dev; do
+        log_info "Removing paired device $dev"
+        bluetoothctl remove "$dev" >/dev/null
+    done
+}
+
+# Validate connectivity using l2ping
+bt_l2ping_check() {
+    target_mac="$1"
+    logfile="$2"
+
+    if ! command -v l2ping >/dev/null 2>&1; then
+        log_warn "l2ping command not available - skipping"
+        return 1
+    fi
+
+    log_info "Running l2ping test for $target_mac"
+    if l2ping -c 3 -t 5 "$target_mac" >>"$logfile" 2>&1; then
+        log_pass "l2ping to $target_mac succeeded"
+        return 0
+    else
+        log_warn "l2ping to $target_mac failed"
+        return 1
+    fi
+}
+
