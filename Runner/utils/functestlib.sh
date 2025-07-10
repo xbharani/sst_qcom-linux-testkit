@@ -1011,4 +1011,87 @@ bt_l2ping_check() {
         return 1
     fi
 }
-
+# Find remoteproc path by firmware substring
+get_remoteproc_path_by_firmware() {
+    name="$1"
+    idx=""
+    path=""
+    idx=$(cat /sys/class/remoteproc/remoteproc*/firmware 2>/dev/null | grep -n "$name" | cut -d: -f1 | head -n1)
+    [ -z "$idx" ] && return 1
+    idx=$((idx - 1))
+    path="/sys/class/remoteproc/remoteproc${idx}"
+    [ -d "$path" ] && echo "$path" && return 0
+    return 1
+}
+ 
+# Get remoteproc state
+get_remoteproc_state() {
+    rproc_path="$1"
+    [ -f "$rproc_path/state" ] && cat "$rproc_path/state"
+}
+ 
+# Wait for a remoteproc to reach a specific state
+wait_remoteproc_state() {
+    rproc_path="$1"
+    target="$2"
+    retries="${3:-6}"
+    i=0
+    while [ $i -lt "$retries" ]; do
+        state=$(get_remoteproc_state "$rproc_path")
+        [ "$state" = "$target" ] && return 0
+        sleep 1
+        i=$((i+1))
+    done
+    return 1
+}
+ 
+# Stop remoteproc
+stop_remoteproc() {
+    rproc_path="$1"
+    echo stop > "$rproc_path/state"
+    wait_remoteproc_state "$rproc_path" "offline" 6
+}
+ 
+# Start remoteproc
+start_remoteproc() {
+    rproc_path="$1"
+    echo start > "$rproc_path/state"
+    wait_remoteproc_state "$rproc_path" "running" 6
+}
+ 
+# Validate remoteproc running state with retries and logging
+validate_remoteproc_running() {
+    fw_name="$1"
+    log_file="${2:-/dev/null}"
+    max_wait_secs="${3:-10}"
+    delay_per_try_secs="${4:-1}"
+ 
+    rproc_path=$(get_remoteproc_path_by_firmware "$fw_name")
+    if [ -z "$rproc_path" ]; then
+        echo "[ERROR] Remoteproc for '$fw_name' not found" >> "$log_file"
+        {
+            echo "---- Last 20 remoteproc dmesg logs ----"
+            dmesg | grep -i "remoteproc" | tail -n 20
+            echo "----------------------------------------"
+        } >> "$log_file"
+        return 1
+    fi
+ 
+    total_waited=0
+    while [ "$total_waited" -lt "$max_wait_secs" ]; do
+        state=$(get_remoteproc_state "$rproc_path")
+        if [ "$state" = "running" ]; then
+            return 0
+        fi
+        sleep "$delay_per_try_secs"
+        total_waited=$((total_waited + delay_per_try_secs))
+    done
+ 
+    echo "[ERROR] $fw_name remoteproc did not reach 'running' state within ${max_wait_secs}s (last state: $state)" >> "$log_file"
+    {
+        echo "---- Last 20 remoteproc dmesg logs ----"
+        dmesg | grep -i "remoteproc" | tail -n 20
+        echo "----------------------------------------"
+    } >> "$log_file"
+    return 1
+}
