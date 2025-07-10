@@ -2,7 +2,6 @@
 
 # Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 # SPDX-License-Identifier: BSD-3-Clause-Clear
-
 # Robustly find and source init_env
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 INIT_ENV=""
@@ -14,12 +13,12 @@ while [ "$SEARCH" != "/" ]; do
     fi
     SEARCH=$(dirname "$SEARCH")
 done
- 
+
 if [ -z "$INIT_ENV" ]; then
     echo "[ERROR] Could not find init_env (starting at $SCRIPT_DIR)" >&2
     exit 1
 fi
- 
+
 # Only source if not already loaded (idempotent)
 if [ -z "$__INIT_ENV_LOADED" ]; then
     # shellcheck disable=SC1090
@@ -28,65 +27,48 @@ fi
 # Always source functestlib.sh, using $TOOLS exported by init_env
 # shellcheck disable=SC1090,SC1091
 . "$TOOLS/functestlib.sh"
-
+ 
 TESTNAME="adsp_remoteproc"
+firmware_name="adsp"
+res_file="./$TESTNAME.res"
+LOG_FILE="./$TESTNAME.log"
+ 
+exec > >(tee -a "$LOG_FILE") 2>&1
+ 
 test_path=$(find_test_case_by_name "$TESTNAME")
 cd "$test_path" || exit 1
-# shellcheck disable=SC2034
-res_file="./$TESTNAME.res"
-
+ 
 log_info "-----------------------------------------------------------------------------------------"
-log_info "-------------------Starting $TESTNAME Testcase----------------------------"
+log_info "------------------- Starting $TESTNAME Testcase ----------------------------"
 log_info "=== Test Initialization ==="
-
-# Get the firmware output and find the position of adsp
-log_info "Checking for firmware"
-firmware_output=$(cat /sys/class/remoteproc/remoteproc*/firmware)
-adsp_position=$(echo "$firmware_output" | grep -n "adsp" | cut -d: -f1)
-
-# Adjust the position to match the remoteproc numbering (starting from 0)
-remoteproc_number=$((adsp_position - 1))
-
-# Construct the remoteproc path based on the adsp position
-remoteproc_path="/sys/class/remoteproc/remoteproc${remoteproc_number}"
-log_info "Remoteproc node is $remoteproc_path"
-# Execute command 1 and check if the output is "running"
-state1=$(cat ${remoteproc_path}/state)
-
-if [ "$state1" != "running" ]; then
-    log_fail "$TESTNAME : Test Failed"
-    echo "$TESTNAME FAIL" > "$test_path/$TESTNAME.res"
+ 
+if ! validate_remoteproc_running "$firmware_name" "$LOG_FILE" 15 2; then
+    log_fail "$firmware_name remoteproc is not in running state after bootup"
+    echo "$TESTNAME FAIL" > "$res_file"
     exit 1
 fi
-
-# Execute command 2 (no output expected)
-log_info "Stopping remoteproc"
-echo stop > ${remoteproc_path}/state
-
-# Execute command 3 and check if the output is "offline"
-state3=$(cat ${remoteproc_path}/state)
-if [ "$state3" != "offline" ]; then
-    log_fail "adsp stop failed"
-    echo "$TESTNAME FAIL" > "$test_path/$TESTNAME.res"
+ 
+log_pass "$firmware_name remoteproc validated as running"
+ 
+rproc_path=$(get_remoteproc_path_by_firmware "$firmware_name")
+ 
+stop_remoteproc "$rproc_path" || {
+    log_fail "$TESTNAME stop failed"
+    echo "$TESTNAME FAIL" > "$res_file"
     exit 1
-else
-    log_pass "adsp stop successful"
-fi
-log_info "Restarting remoteproc"
-# Execute command 4 (no output expected)
-echo start > ${remoteproc_path}/state
-
-# Execute command 5 and check if the output is "running"
-state5=$(cat ${remoteproc_path}/state)
-if [ "$state5" != "running" ]; then
-    log_fail "adsp start failed"
-    echo "$TESTNAME FAIL" > "$res_file" 
+}
+log_pass "$firmware_name stop successful"
+ 
+log_info "Restarting $firmware_name"
+start_remoteproc "$rproc_path" || {
+    log_fail "$TESTNAME start failed"
+    echo "$TESTNAME FAIL" > "$res_file"
     exit 1
-fi
-
-# If all checks pass, print "PASS"
-echo "adsp PASS"
-log_pass "adsp PASS"
+}
+ 
+log_pass "$firmware_name PASS"
 echo "$TESTNAME PASS" > "$res_file"
-log_info "-------------------Completed $TESTNAME Testcase----------------------------"
+ 
+log_info "------------------- Completed $TESTNAME Testcase ----------------------------"
 exit 0
+ 
