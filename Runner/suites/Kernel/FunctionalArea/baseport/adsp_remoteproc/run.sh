@@ -33,8 +33,6 @@ firmware_name="adsp"
 res_file="./$TESTNAME.res"
 LOG_FILE="./$TESTNAME.log"
  
-exec > >(tee -a "$LOG_FILE") 2>&1
- 
 test_path=$(find_test_case_by_name "$TESTNAME")
 cd "$test_path" || exit 1
  
