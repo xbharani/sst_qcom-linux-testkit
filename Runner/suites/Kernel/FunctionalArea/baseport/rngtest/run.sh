@@ -44,21 +44,34 @@ TMP_OUT="/tmp/rngtest_output.txt"
 ENTROPY_MB=10
 COUNT=1000
 PASS_THRESHOLD=997
-RNG_SOURCE="/dev/urandom"
-[ -e /dev/hwrng ] && RNG_SOURCE="/dev/hwrng"
+RNG_SOURCE=""
+RNG_TIMEOUT=10
 
-log_info "Generating ${ENTROPY_MB}MB entropy input from $RNG_SOURCE"
-if ! dd if="$RNG_SOURCE" of="$TMP_BIN" bs=1M count="$ENTROPY_MB" status=none 2>/dev/null; then
-    log_fail "$TESTNAME : Failed to read random data from $RNG_SOURCE"
-    echo "$TESTNAME FAIL" > "$res_file"
-    rm -f "$TMP_BIN"
-    exit 1
+# Preferred order: hwrng -> urandom
+if [ -e /dev/hwrng ]; then
+    log_info "Attempting to read $ENTROPY_MB MB entropy from /dev/hwrng with timeout $RNG_TIMEOUT sec"
+    if timeout "$RNG_TIMEOUT" dd if=/dev/hwrng of="$TMP_BIN" bs=1M count="$ENTROPY_MB" status=none 2>/dev/null; then
+        RNG_SOURCE="/dev/hwrng"
+        log_info "Successfully read entropy from /dev/hwrng"
+    else
+        log_warn "/dev/hwrng read failed or timed out, falling back to /dev/urandom"
+    fi
+fi
+
+if [ -z "$RNG_SOURCE" ]; then
+    log_info "Using fallback source: /dev/urandom"
+    if ! dd if=/dev/urandom of="$TMP_BIN" bs=1M count="$ENTROPY_MB" status=none 2>/dev/null; then
+	RNG_SOURCE="/dev/urandom"
+        log_fail "$TESTNAME : Failed to read from /dev/urandom as fallback"
+        echo "$TESTNAME FAIL" > "$res_file"
+        rm -f "$TMP_BIN"
+        exit 1
+    fi
 fi
 
 log_info "Running rngtest -c $COUNT < $TMP_BIN"
 rngtest -c "$COUNT" < "$TMP_BIN" > "$TMP_OUT" 2>&1
 
-# Try to extract success count regardless of return code
 successes=$(awk '/FIPS 140-2 successes:/ {print $NF}' "$TMP_OUT" | head -n1)
 
 if [ -z "$successes" ] || ! echo "$successes" | grep -Eq '^[0-9]+$'; then
