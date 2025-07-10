@@ -2,8 +2,8 @@
  
 # Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 # SPDX-License-Identifier: BSD-3-Clause-Clear
- 
-# Source init_env and functestlib.sh
+
+# Robustly find and source init_env
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 INIT_ENV=""
 SEARCH="$SCRIPT_DIR"
@@ -14,33 +14,36 @@ while [ "$SEARCH" != "/" ]; do
     fi
     SEARCH=$(dirname "$SEARCH")
 done
- 
+
 if [ -z "$INIT_ENV" ]; then
     echo "[ERROR] Could not find init_env (starting at $SCRIPT_DIR)" >&2
     exit 1
 fi
- 
-# shellcheck disable=SC1090
-. "$INIT_ENV"
- 
+
+if [ -z "$__INIT_ENV_LOADED" ]; then
+    # shellcheck disable=SC1090
+    . "$INIT_ENV"
+fi
 # shellcheck disable=SC1090,SC1091
 . "$TOOLS/functestlib.sh"
- 
-TESTNAME="Bluetooth"
+
+TESTNAME="BT_ON_FF"
 test_path=$(find_test_case_by_name "$TESTNAME") || {
     log_fail "$TESTNAME : Test directory not found."
     echo "$TESTNAME FAIL" > "./$TESTNAME.res"
     exit 1
 }
- 
+
 cd "$test_path" || exit 1
 res_file="./$TESTNAME.res"
 rm -f "$res_file"
- 
-log_info "-----------------------------------------------------------------------------------------"
-log_info "-------------------Starting $TESTNAME Testcase----------------------------"
+
+log_info "------------------------------------------------------------"
+log_info "Starting $TESTNAME Testcase"
 log_info "Checking dependency: bluetoothctl"
-check_dependencies bluetoothctl
+
+# verify that all necessary dependencies
+check_dependencies bluetoothctl pgrep
  
 log_info "Checking if bluetoothd is running..."
 MAX_RETRIES=3
