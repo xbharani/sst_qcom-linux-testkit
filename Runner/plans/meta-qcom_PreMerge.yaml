@@ -16,18 +16,18 @@ run:
         - cd Runner
         - $PWD/suites/Connectivity/Ethernet/run.sh || true
         - $PWD/utils/send-to-lava.sh $PWD/suites/Connectivity/Ethernet/Ethernet.res || true
-        - $PWD/suites/Kernel/FunctionalArea/baseport/adsp_remoteproc/run.sh || true
-        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/FunctionalArea/baseport/adsp_remoteproc/adsp_remoteproc.res || true
-        - $PWD/suites/Kernel/FunctionalArea/baseport/cdsp_remoteproc/run.sh || true
-        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/FunctionalArea/baseport/cdsp_remoteproc/cdsp_remoteproc.res || true
-        - $PWD/suites/Kernel/FunctionalArea/baseport/IPA/run.sh || true
-        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/FunctionalArea/baseport/IPA/IPA.res || true
-        - $PWD/suites/Kernel/FunctionalArea/baseport/pinctrl/run.sh || true
-        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/FunctionalArea/baseport/pinctrl/pinctrl.res || true
-        - $PWD/suites/Kernel/FunctionalArea/baseport/remoteproc/run.sh || true
-        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/FunctionalArea/baseport/remoteproc/remoteproc.res || true
-        - $PWD/suites/Kernel/FunctionalArea/baseport/wpss_remoteproc/run.sh || true
-        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/FunctionalArea/baseport/wpss_remoteproc/wpss_remoteproc.res || true
+        - $PWD/suites/Kernel/Baseport/adsp_remoteproc/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/adsp_remoteproc/adsp_remoteproc.res || true
+        - $PWD/suites/Kernel/Baseport/cdsp_remoteproc/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/cdsp_remoteproc/cdsp_remoteproc.res || true
+        - $PWD/suites/Kernel/Baseport/IPA/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/IPA/IPA.res || true
+        - $PWD/suites/Kernel/Baseport/pinctrl/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/pinctrl/pinctrl.res || true
+        - $PWD/suites/Kernel/Baseport/remoteproc/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/remoteproc/remoteproc.res || true
+        - $PWD/suites/Kernel/Baseport/wpss_remoteproc/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/wpss_remoteproc/wpss_remoteproc.res || true
         - $PWD/suites/Multimedia/Graphics/KMSCube/run.sh || true
         - $PWD/utils/send-to-lava.sh $PWD/suites/Multimedia/Graphics/KMSCube/KMSCube.res || true
         - $PWD/suites/Multimedia/Graphics/weston-simple-egl/run.sh || true
