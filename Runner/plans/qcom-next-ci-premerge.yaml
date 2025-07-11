@@ -14,46 +14,46 @@ metadata:
 run:
     steps:
         - cd Runner
-        - $PWD/suites/Kernel/FunctionalArea/baseport/adsp_remoteproc/run.sh || true
-        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/FunctionalArea/baseport/adsp_remoteproc/adsp_remoteproc.res || true
-        - $PWD/suites/Kernel/FunctionalArea/baseport/cdsp_remoteproc/run.sh || true
-        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/FunctionalArea/baseport/cdsp_remoteproc/cdsp_remoteproc.res || true
-        - $PWD/suites/Kernel/FunctionalArea/baseport/CPUFreq_Validation/run.sh || true
-        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/FunctionalArea/baseport/CPUFreq_Validation/CPUFreq_Validation.res || true
-        - $PWD/suites/Kernel/FunctionalArea/baseport/GIC/run.sh || true
-        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/FunctionalArea/baseport/GIC/GIC.res || true
-        - $PWD/suites/Kernel/FunctionalArea/baseport/hotplug/run.sh || true
-        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/FunctionalArea/baseport/hotplug/hotplug.res || true
-        - $PWD/suites/Kernel/FunctionalArea/baseport/Interrupts/run.sh || true
-        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/FunctionalArea/baseport/Interrupts/Interrupts.res || true
-        - $PWD/suites/Kernel/FunctionalArea/baseport/irq/run.sh || true
-        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/FunctionalArea/baseport/irq/irq.res || true
-        - $PWD/suites/Kernel/FunctionalArea/baseport/kaslr/run.sh || true
-        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/FunctionalArea/baseport/kaslr/kaslr.res || true
-        - $PWD/suites/Kernel/FunctionalArea/baseport/MEMLAT/run.sh || true
-        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/FunctionalArea/baseport/MEMLAT/MEMLAT.res || true
-        - $PWD/suites/Kernel/FunctionalArea/baseport/pinctrl/run.sh || true
-        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/FunctionalArea/baseport/pinctrl/pinctrl.res || true
-        - $PWD/suites/Kernel/FunctionalArea/baseport/Reboot_health_check/run.sh || true
-        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/FunctionalArea/baseport/Reboot_health_check/Reboot_health_check.res || true
-        - $PWD/suites/Kernel/FunctionalArea/baseport/remoteproc/run.sh || true
-        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/FunctionalArea/baseport/remoteproc/remoteproc.res || true
-        - $PWD/suites/Kernel/FunctionalArea/baseport/RMNET/run.sh || true
-        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/FunctionalArea/baseport/RMNET/RMNET.res || true
-        - $PWD/suites/Kernel/FunctionalArea/baseport/IPA/run.sh || true
-        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/FunctionalArea/baseport/IPA/IPA.res || true
-        - $PWD/suites/Kernel/FunctionalArea/baseport/Probe_Failure_Check/run.sh || true
-        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/FunctionalArea/baseport/Probe_Failure_Check/Probe_Failure_Check.res || true
-        - $PWD/suites/Kernel/FunctionalArea/baseport/rngtest/run.sh || true
-        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/FunctionalArea/baseport/rngtest/rngtest.res || true
-        - $PWD/suites/Kernel/FunctionalArea/baseport/smmu/run.sh || true
-        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/FunctionalArea/baseport/smmu/smmu.res || true
-        - $PWD/suites/Kernel/FunctionalArea/baseport/storage/run.sh || true
-        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/FunctionalArea/baseport/storage/storage.res || true
-        - $PWD/suites/Kernel/FunctionalArea/baseport/wpss_remoteproc/run.sh || true
-        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/FunctionalArea/baseport/wpss_remoteproc/wpss_remoteproc.res || true
-        - $PWD/suites/Kernel/FunctionalArea/DCVS/Freq_Scaling/run.sh || true
-        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/FunctionalArea/DCVS/Freq_Scaling/Freq_Scaling.res || true
-        - $PWD/suites/Kernel/FunctionalArea/Scheduler/CPU_affinity/run.sh || true
-        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/FunctionalArea/Scheduler/CPU_affinity/CPU_affinity.res || true
+        - $PWD/suites/Kernel/Baseport/adsp_remoteproc/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/adsp_remoteproc/adsp_remoteproc.res || true
+        - $PWD/suites/Kernel/Baseport/cdsp_remoteproc/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/cdsp_remoteproc/cdsp_remoteproc.res || true
+        - $PWD/suites/Kernel/Baseport/CPUFreq_Validation/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/CPUFreq_Validation/CPUFreq_Validation.res || true
+        - $PWD/suites/Kernel/Baseport/GIC/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/GIC/GIC.res || true
+        - $PWD/suites/Kernel/Baseport/hotplug/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/hotplug/hotplug.res || true
+        - $PWD/suites/Kernel/Baseport/Interrupts/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/Interrupts/Interrupts.res || true
+        - $PWD/suites/Kernel/Baseport/irq/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/irq/irq.res || true
+        - $PWD/suites/Kernel/Baseport/kaslr/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/kaslr/kaslr.res || true
+        - $PWD/suites/Kernel/Baseport/MEMLAT/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/MEMLAT/MEMLAT.res || true
+        - $PWD/suites/Kernel/Baseport/pinctrl/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/pinctrl/pinctrl.res || true
+        - $PWD/suites/Kernel/Baseport/Reboot_health_check/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/Reboot_health_check/Reboot_health_check.res || true
+        - $PWD/suites/Kernel/Baseport/remoteproc/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/remoteproc/remoteproc.res || true
+        - $PWD/suites/Kernel/Baseport/RMNET/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/RMNET/RMNET.res || true
+        - $PWD/suites/Kernel/Baseport/IPA/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/IPA/IPA.res || true
+        - $PWD/suites/Kernel/Baseport/Probe_Failure_Check/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/Probe_Failure_Check/Probe_Failure_Check.res || true
+        - $PWD/suites/Kernel/Baseport/rngtest/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/rngtest/rngtest.res || true
+        - $PWD/suites/Kernel/Baseport/smmu/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/smmu/smmu.res || true
+        - $PWD/suites/Kernel/Baseport/storage/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/storage/storage.res || true
+        - $PWD/suites/Kernel/Baseport/wpss_remoteproc/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/wpss_remoteproc/wpss_remoteproc.res || true
+        - $PWD/suites/Kernel/DCVS/Freq_Scaling/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/DCVS/Freq_Scaling/Freq_Scaling.res || true
+        - $PWD/suites/Kernel/Scheduler/CPU_affinity/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Scheduler/CPU_affinity/CPU_affinity.res || true
         - $PWD/utils/result_parse.sh
