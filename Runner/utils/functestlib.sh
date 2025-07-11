@@ -1023,13 +1023,13 @@ get_remoteproc_path_by_firmware() {
     [ -d "$path" ] && echo "$path" && return 0
     return 1
 }
- 
+
 # Get remoteproc state
 get_remoteproc_state() {
     rproc_path="$1"
     [ -f "$rproc_path/state" ] && cat "$rproc_path/state"
 }
- 
+
 # Wait for a remoteproc to reach a specific state
 wait_remoteproc_state() {
     rproc_path="$1"
@@ -1044,28 +1044,28 @@ wait_remoteproc_state() {
     done
     return 1
 }
- 
+
 # Stop remoteproc
 stop_remoteproc() {
     rproc_path="$1"
     echo stop > "$rproc_path/state"
     wait_remoteproc_state "$rproc_path" "offline" 6
 }
- 
+
 # Start remoteproc
 start_remoteproc() {
     rproc_path="$1"
     echo start > "$rproc_path/state"
     wait_remoteproc_state "$rproc_path" "running" 6
 }
- 
+
 # Validate remoteproc running state with retries and logging
 validate_remoteproc_running() {
     fw_name="$1"
     log_file="${2:-/dev/null}"
     max_wait_secs="${3:-10}"
     delay_per_try_secs="${4:-1}"
- 
+
     rproc_path=$(get_remoteproc_path_by_firmware "$fw_name")
     if [ -z "$rproc_path" ]; then
         echo "[ERROR] Remoteproc for '$fw_name' not found" >> "$log_file"
@@ -1076,7 +1076,7 @@ validate_remoteproc_running() {
         } >> "$log_file"
         return 1
     fi
- 
+
     total_waited=0
     while [ "$total_waited" -lt "$max_wait_secs" ]; do
         state=$(get_remoteproc_state "$rproc_path")
@@ -1086,7 +1086,7 @@ validate_remoteproc_running() {
         sleep "$delay_per_try_secs"
         total_waited=$((total_waited + delay_per_try_secs))
     done
- 
+
     echo "[ERROR] $fw_name remoteproc did not reach 'running' state within ${max_wait_secs}s (last state: $state)" >> "$log_file"
     {
         echo "---- Last 20 remoteproc dmesg logs ----"
@@ -1094,4 +1094,302 @@ validate_remoteproc_running() {
         echo "----------------------------------------"
     } >> "$log_file"
     return 1
+}
+
+# Clean up WiFi test environment (reusable for other tests)
+wifi_cleanup() {
+    iface="$1"
+    log_info "Cleaning up WiFi test environment..."
+    killall -q wpa_supplicant 2>/dev/null
+    rm -f /tmp/wpa_supplicant.conf nmcli.log wpa.log
+    if [ -n "$iface" ]; then
+        ip link set "$iface" down 2>/dev/null || ifconfig "$iface" down 2>/dev/null
+    fi
+}
+
+# Extract credentials from args/env/file
+get_wifi_credentials() {
+    ssid="$1"
+    pass="$2"
+    if [ -z "$ssid" ] || [ -z "$pass" ]; then
+        ssid="${SSID:-$ssid}"
+        pass="${PASSWORD:-$pass}"
+    fi
+    if [ -z "$ssid" ] || [ -z "$pass" ]; then
+        if [ -f "./ssid_list.txt" ]; then
+            read -r ssid pass _ < ./ssid_list.txt
+        fi
+    fi
+    ssid=$(echo "$ssid" | xargs)
+    pass=$(echo "$pass" | xargs)
+    if [ -z "$ssid" ] || [ -z "$pass" ]; then
+        return 1
+    fi
+    printf '%s %s\n' "$ssid" "$pass"
+    return 0
+}
+
+# POSIX-compliant: Retry a shell command up to N times with delay
+retry_command() {
+    cmd="$1"
+    retries="$2"
+    delay="$3"
+    i=1
+    while [ "$i" -le "$retries" ]; do
+        if eval "$cmd"; then
+            return 0
+        fi
+        log_warn "Attempt $i/$retries failed: $cmd"
+        i=$((i + 1))
+        sleep "$delay"
+    done
+    return 1
+}
+
+# Connect using nmcli with retries (returns 0 on success)
+wifi_connect_nmcli() {
+    iface="$1"
+    ssid="$2"
+    pass="$3"
+    if command -v nmcli >/dev/null 2>&1; then
+        log_info "Trying to connect using nmcli..."
+        retry_command "nmcli dev wifi connect \"$ssid\" password \"$pass\" ifname \"$iface\" 2>&1 | tee nmcli.log" 3 3
+        return $?
+    fi
+    return 1
+}
+
+# Connect using wpa_supplicant+udhcpc with retries (returns 0 on success)
+wifi_connect_wpa_supplicant() {
+    iface="$1"
+    ssid="$2"
+    pass="$3"
+    if command -v wpa_supplicant >/dev/null 2>&1 && command -v udhcpc >/dev/null 2>&1; then
+        log_info "Falling back to wpa_supplicant + udhcpc"
+        WPA_CONF="/tmp/wpa_supplicant.conf"
+        {
+            echo "ctrl_interface=/var/run/wpa_supplicant"
+            echo "network={"
+            echo " ssid=\"$ssid\""
+            echo " key_mgmt=WPA-PSK"
+            echo " pairwise=CCMP TKIP"
+            echo " group=CCMP TKIP"
+            echo " psk=\"$pass\""
+            echo "}"
+        } > "$WPA_CONF"
+        killall -q wpa_supplicant 2>/dev/null
+        retry_command "wpa_supplicant -B -i \"$iface\" -D nl80211 -c \"$WPA_CONF\" 2>&1 | tee wpa.log" 3 2
+        sleep 4
+        udhcpc -i "$iface" >/dev/null 2>&1
+        sleep 2
+        return 0
+    fi
+    log_error "Neither nmcli nor wpa_supplicant+udhcpc available"
+    return 1
+}
+
+# Get IPv4 address (returns IP or empty)
+wifi_get_ip() {
+    iface="$1"
+    ip=""
+    if command -v ifconfig >/dev/null 2>&1; then
+        ip=$(ifconfig "$iface" 2>/dev/null | awk '/inet / {print $2; exit}')
+    fi
+    if [ -z "$ip" ] && command -v ip >/dev/null 2>&1; then
+        ip=$(ip addr show "$iface" 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1 | head -n1)
+    fi
+    echo "$ip"
+}
+
+# Log+exit helpers with optional cleanup
+log_pass_exit() {
+    # Usage: log_pass_exit "$TESTNAME" "Message" cleanup_func arg
+    TESTNAME="$1"
+    MSG="$2"
+    CLEANUP_FUNC="$3"
+    CLEANUP_ARG="$4"
+    log_pass "$MSG"
+    echo "$TESTNAME PASS" > "./$TESTNAME.res"
+    if [ -n "$CLEANUP_FUNC" ] && command -v "$CLEANUP_FUNC" >/dev/null 2>&1; then
+        "$CLEANUP_FUNC" "$CLEANUP_ARG"
+    fi
+    exit 0
+}
+
+log_fail_exit() {
+    # Usage: log_fail_exit "$TESTNAME" "Message" cleanup_func arg
+    TESTNAME="$1"
+    MSG="$2"
+    CLEANUP_FUNC="$3"
+    CLEANUP_ARG="$4"
+    log_fail "$MSG"
+    echo "$TESTNAME FAIL" > "./$TESTNAME.res"
+    if [ -n "$CLEANUP_FUNC" ] && command -v "$CLEANUP_FUNC" >/dev/null 2>&1; then
+        "$CLEANUP_FUNC" "$CLEANUP_ARG"
+    fi
+    exit 1
+}
+
+log_skip_exit() {
+    # Usage: log_skip_exit "$TESTNAME" "Message" cleanup_func arg
+    TESTNAME="$1"
+    MSG="$2"
+    CLEANUP_FUNC="$3"
+    CLEANUP_ARG="$4"
+    log_skip "$MSG"
+    echo "$TESTNAME SKIP" > "./$TESTNAME.res"
+    if [ -n "$CLEANUP_FUNC" ] && command -v "$CLEANUP_FUNC" >/dev/null 2>&1; then
+        "$CLEANUP_FUNC" "$CLEANUP_ARG"
+    fi
+    exit 0
+}
+
+# Robust systemd service check: returns 0 if networkd up, 0 if systemd missing, 1 if error
+check_systemd_services() {
+    # If systemd not present, pass for minimal or kernel-only builds
+    if ! command -v systemctl >/dev/null 2>&1; then
+        log_info "systemd/systemctl not found (kernel/minimal build). Skipping service checks."
+        return 0
+    fi
+    for service in "$@"; do
+        if systemctl is-enabled "$service" >/dev/null 2>&1; then
+            if ! systemctl is-active --quiet "$service"; then
+                log_warn "$service not running. Retrying start..."
+                retry_command "systemctl start $service" 3 2
+                if ! systemctl is-active --quiet "$service"; then
+                    log_fail "$service failed to start after 3 retries."
+                    return 1
+                else
+                    log_pass "$service started after retry."
+                fi
+            fi
+        else
+            log_warn "$service not enabled or not found."
+        fi
+    done
+    return 0
+}
+
+# Ensure udhcpc default.script exists, create if missing
+ensure_udhcpc_script() {
+    udhcpc_dir="/usr/share/udhcpc"
+    udhcpc_script="$udhcpc_dir/default.script"
+    udhcpc_backup="$udhcpc_script.bak"
+
+    if [ ! -d "$udhcpc_dir" ]; then
+        mkdir -p "$udhcpc_dir" || return 1
+    fi
+
+    # Backup if script already exists and is not a backup yet
+    if [ -f "$udhcpc_script" ] && [ ! -f "$udhcpc_backup" ]; then
+        cp "$udhcpc_script" "$udhcpc_backup"
+    fi
+
+    if [ ! -x "$udhcpc_script" ]; then
+        cat > "$udhcpc_script" <<'EOF'
+#!/bin/sh
+case "$1" in
+    deconfig)
+        ip addr flush dev "$interface"
+        ;;
+    renew|bound)
+        echo "[INFO] Configuring $interface with IP: $ip/$subnet"
+        ip addr flush dev "$interface"
+        ip addr add "$ip/$subnet" dev "$interface"
+        ip link set "$interface" up
+        if [ -n "$router" ]; then
+            ip route del default dev "$interface" 2>/dev/null
+            ip route add default via "$router" dev "$interface"
+        fi
+echo "[INFO] Setting DNS to 8.8.8.8"
+echo "nameserver 8.8.8.8" > /etc/resolv.conf
+        ;;
+esac
+exit 0
+EOF
+        chmod +x "$udhcpc_script"
+    fi
+
+    echo "$udhcpc_script"
+}
+
+# Resotre back the default.script
+restore_udhcpc_script() {
+    udhcpc_dir="/usr/share/udhcpc"
+    udhcpc_script="$udhcpc_dir/default.script"
+    udhcpc_backup="$udhcpc_script.bak"
+
+    if [ -f "$udhcpc_backup" ]; then
+        mv -f "$udhcpc_backup" "$udhcpc_script"
+        echo "[INFO] Restored original udhcpc default.script"
+    fi
+}
+
+# Bring an interface up or down using available tools
+# Usage: bring_interface_up_down <iface> <up|down>
+bring_interface_up_down() {
+    iface="$1"
+    state="$2"
+    if command -v ip >/dev/null 2>&1; then
+        ip link set "$iface" "$state"
+    elif command -v ifconfig >/dev/null 2>&1; then
+        if [ "$state" = "up" ]; then
+            ifconfig "$iface" up
+        else
+            ifconfig "$iface" down
+        fi
+    else
+        log_error "No ip or ifconfig tools found to bring $iface $state"
+        return 1
+    fi
+}
+
+wifi_write_wpa_conf() {
+    iface="$1"
+    ssid="$2"
+    pass="$3"
+    conf_file="/tmp/wpa_supplicant_${iface}.conf"
+    {
+        echo "ctrl_interface=/var/run/wpa_supplicant"
+        echo "network={"
+        echo " ssid=\"$ssid\""
+        echo " key_mgmt=WPA-PSK"
+        echo " pairwise=CCMP TKIP"
+        echo " group=CCMP TKIP"
+        echo " psk=\"$pass\""
+        echo "}"
+    } > "$conf_file"
+    echo "$conf_file"
+}
+
+# Find the first available WiFi interface (wl* or wlan0), using 'ip' or 'ifconfig'.
+# Prints the interface name, or returns non-zero if not found.
+get_wifi_interface() {
+    WIFI_IF=""
+
+    # Prefer 'ip' if available.
+    if command -v ip >/dev/null 2>&1; then
+        WIFI_IF=$(ip link | awk -F: '/ wl/ {print $2}' | tr -d ' ' | head -n1)
+        if [ -z "$WIFI_IF" ]; then
+            WIFI_IF=$(ip link | awk -F: '/^[0-9]+: wl/ {print $2}' | tr -d ' ' | head -n1)
+        fi
+        if [ -z "$WIFI_IF" ] && ip link show wlan0 >/dev/null 2>&1; then
+            WIFI_IF="wlan0"
+        fi
+    else
+        # Fallback to 'ifconfig' if 'ip' is missing.
+        if command -v ifconfig >/dev/null 2>&1; then
+            WIFI_IF=$(ifconfig -a 2>/dev/null | grep -o '^wl[^:]*' | head -n1)
+            if [ -z "$WIFI_IF" ] && ifconfig wlan0 >/dev/null 2>&1; then
+                WIFI_IF="wlan0"
+            fi
+        fi
+    fi
+
+    if [ -n "$WIFI_IF" ]; then
+        echo "$WIFI_IF"
+        return 0
+    else
+        return 1
+    fi
 }
