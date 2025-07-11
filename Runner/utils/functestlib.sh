@@ -1393,3 +1393,69 @@ get_wifi_interface() {
         return 1
     fi
 }
+
+# Auto-detect eMMC block device (non-removable, not UFS)
+detect_emmc_partition_block() {
+    if command -v lsblk >/dev/null 2>&1 && command -v udevadm >/dev/null 2>&1; then
+        for part in $(lsblk -lnpo NAME,TYPE | awk '$2 == "part" {print $1}'); do
+            if udevadm info --query=all --name="$part" 2>/dev/null | grep -qi "mmcblk"; then
+                echo "$part"
+                return 0
+            fi
+        done
+    fi
+
+    for part in /dev/mmcblk*p[0-9]*; do
+        [ -e "$part" ] || continue
+        if command -v udevadm >/dev/null 2>&1 && udevadm info --query=all --name="$part" | grep -qi "mmcblk"; then
+            echo "$part"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Auto-detect UFS block device (via udev vendor info or path hint)
+detect_ufs_partition_block() {
+    if command -v lsblk >/dev/null 2>&1 && command -v udevadm >/dev/null 2>&1; then
+        for part in $(lsblk -lnpo NAME,TYPE | awk '$2 == "part" {print $1}'); do
+            if udevadm info --query=all --name="$part" 2>/dev/null | grep -qi "ufs"; then
+                echo "$part"
+                return 0
+            fi
+        done
+    fi
+
+    for part in /dev/sd[a-z][0-9]*; do
+        [ -e "$part" ] || continue
+        if command -v udevadm >/dev/null 2>&1 &&
+           udevadm info --query=all --name="$part" 2>/dev/null | grep -qi "ufs"; then
+            echo "$part"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Check for dmesg I/O errors and log summary
+scan_dmesg_errors() {
+    label="$1"
+    output_dir="$2"
+
+    [ -z "$output_dir" ] && output_dir="."
+    snapshot_file="$output_dir/${label}_dmesg_snapshot.log"
+    error_file="$output_dir/${label}_dmesg_errors.log"
+
+    log_info "Scanning dmesg for recent I/O errors..."
+    dmesg | tail -n 300 > "$snapshot_file"
+    grep -iE "error|fail|timeout|reset|crc" "$snapshot_file" > "$error_file"
+
+    if [ -s "$error_file" ]; then
+        log_warn "Detected potential $label-related errors in dmesg:"
+        while read -r line; do
+            log_warn " dmesg: $line"
+        done < "$error_file"
+    else
+        log_info "No $label-related errors found in recent dmesg logs."
+    fi
+}
