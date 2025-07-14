@@ -25,9 +25,9 @@ jobs:
         run: |
           echo "Checking only changed shell files in PR..."
           git fetch origin ${{ github.base_ref }}
-          FILES=$(git diff --name-only origin/${{ github.base_ref }} -- '*.sh' | xargs -r -n1 echo | xargs -r realpath --no-symlinks --canonicalize-missing 2>/dev/null || true)
+          FILES=$(git diff --diff-filter=d --name-only origin/${{ github.base_ref }} -- '*.sh')
           if [ -n "$FILES" ]; then
-            echo "$FILES" | tr ' ' '\n' | xargs -r shellcheck -S warning -e SC1091,SC2230,SC3043
+            echo "$FILES" | tr '\n' '\0' | xargs -0 -r shellcheck -S warning -e SC1091,SC2230,SC3043
           else
             echo "No shell files to lint."
           fi
