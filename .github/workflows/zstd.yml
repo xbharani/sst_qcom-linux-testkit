@@ -1,14 +1,20 @@
 name: Zstd Archive Release
 
+# Grant the GITHUB_TOKEN write access so we can create releases & upload assets
+permissions:
+  contents: write
+
 on:
   push:
+    # Trigger on semver tags like v1.2.3
     tags:
       - 'v*.*.*'
-  workflow_dispatch:
+  workflow_dispatch: # allow manual runs
 
 jobs:
   release:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -21,17 +27,15 @@ jobs:
       - name: Extract version info
         id: version
         run: |
-          TAG="${GITHUB_REF#refs/tags/}"
-          SHORT="${TAG#v}"
+          TAG="${GITHUB_REF#refs/tags/}" # e.g. v1.2.3
           echo "tag_name=$TAG" >> $GITHUB_OUTPUT
-          echo "short_tag=$SHORT" >> $GITHUB_OUTPUT
 
-      - name: Create .tar.zst archives
+      - name: Create .tar.zst archive
         run: |
-          git archive --format=tar --prefix=test-definitions/ "${{ steps.version.outputs.tag_name }}" \
-            | zstd -o "$GITHUB_WORKSPACE/${{ steps.version.outputs.tag_name }}.tar.zst"
-          git archive --format=tar --prefix=test-definitions/ "${{ steps.version.outputs.tag_name }}" \
-            | zstd -o "$GITHUB_WORKSPACE/${{ steps.version.outputs.short_tag }}.tar.zst"
+          git archive --format=tar \
+            --prefix=test-definitions/ \
+            "${{ steps.version.outputs.tag_name }}" \
+          | zstd -o "${GITHUB_WORKSPACE}/${{ steps.version.outputs.tag_name }}.tar.zst"
 
       - name: Create GitHub Release
         id: create_release
@@ -44,18 +48,10 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Upload full-tag .tar.zst
+      - name: Upload .tar.zst to GitHub Release
         uses: actions/upload-release-asset@v1
         with:
           upload_url: ${{ steps.create_release.outputs.upload_url }}
           asset_path: ${{ github.workspace }}/${{ steps.version.outputs.tag_name }}.tar.zst
           asset_name: ${{ steps.version.outputs.tag_name }}.tar.zst
-          asset_content_type: application/zstd
-
-      - name: Upload short-tag .tar.zst
-        uses: actions/upload-release-asset@v1
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: ${{ github.workspace }}/${{ steps.version.outputs.short_tag }}.tar.zst
-          asset_name: ${{ steps.version.outputs.short_tag }}.tar.zst
           asset_content_type: application/zstd
