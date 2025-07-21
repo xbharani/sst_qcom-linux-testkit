@@ -33,17 +33,9 @@ jobs:
       - name: Create .tar.zst archive
         run: |
           git archive --format=tar \
-            --prefix=test-definitions/ \
+            --prefix=qcom-linux-testkit/ \
             "${{ steps.version.outputs.tag_name }}" \
           | zstd -o "${GITHUB_WORKSPACE}/${{ steps.version.outputs.tag_name }}.tar.zst"
-
-      - name: Debug upload context
-        run: |
-          echo "UPLOAD_URL: ${{ steps.create_release.outputs.upload_url }}"
-          echo "GITHUB_TOKEN length: ${#GITHUB_TOKEN}"
-        # ensure this uses your PAT
-        env:
-          GITHUB_TOKEN: ${{ secrets.PAT }}
 
       - name: Create GitHub Release
         id: create_release
