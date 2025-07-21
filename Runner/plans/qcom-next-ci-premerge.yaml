@@ -56,4 +56,12 @@ run:
         - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/DCVS/Freq_Scaling/Freq_Scaling.res || true
         - $PWD/suites/Kernel/Scheduler/CPU_affinity/run.sh || true
         - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Scheduler/CPU_affinity/CPU_affinity.res || true
+        - $PWD/suites/Kernel/Baseport/PCIe/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/PCIe/PCIe.res || true
+        - $PWD/suites/Kernel/Baseport/USBHost/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/USBHost/USBHost.res || true
+        - $PWD/suites/Kernel/Baseport/shmbridge/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/shmbridge/shmbridge.res || true
+        - $PWD/suites/Connectivity/Ethernet/Ethernet/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Connectivity/Ethernet/Ethernet.res || true
         - $PWD/utils/result_parse.sh
