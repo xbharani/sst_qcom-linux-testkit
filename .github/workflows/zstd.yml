@@ -40,13 +40,14 @@ jobs:
       - name: Create GitHub Release
         id: create_release
         uses: actions/create-release@v1
+        env:
+          # use your PAT stored in 'PAT' secret
+          GITHUB_TOKEN: ${{ secrets.PAT }}
         with:
           tag_name: ${{ steps.version.outputs.tag_name }}
           release_name: Release ${{ steps.version.outputs.tag_name }}
           draft: false
           prerelease: false
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload .tar.zst to GitHub Release
         uses: actions/upload-release-asset@v1
@@ -55,3 +56,5 @@ jobs:
           asset_path: ${{ github.workspace }}/${{ steps.version.outputs.tag_name }}.tar.zst
           asset_name: ${{ steps.version.outputs.tag_name }}.tar.zst
           asset_content_type: application/zstd
+          # pass the same PAT for authentication
+          token: ${{ secrets.PAT }}
