@@ -3,11 +3,13 @@ name: Zstd Archive Release
 on:
   push:
     tags:
-      - 'v[0-9]+.[0-9]+.[0-9]+'  # Matching tags like v1.1.0
+      - 'v*.*.*' # match v1.2.3, v10.20.30, etc.
+  workflow_dispatch: # allow manual runs
 
 jobs:
   release:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -18,13 +20,18 @@ jobs:
       - name: Extract version info
         id: version
         run: |
-          TAG_NAME="${GITHUB_REF#refs/tags/}"
+          TAG_NAME="${GITHUB_REF#refs/tags/}" # e.g. v1.2.3
+          SHORT_TAG="${TAG_NAME#v}" # strip leading "v" → 1.2.3
           echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
+          echo "short_tag=$SHORT_TAG" >> $GITHUB_OUTPUT
 
       - name: Create .tar.zst archives using git archive
         run: |
           git archive --format=tar --prefix=test-definitions/ ${{ steps.version.outputs.tag_name }} \
             | zstd -o ../${{ steps.version.outputs.tag_name }}.tar.zst
+          git archive --format=tar --prefix=test-definitions/ ${{ steps.version.outputs.tag_name }} \
+            | zstd -o ../${{ steps.version.outputs.short_tag }}.tar.zst
+
       - name: Upload .tar.zst archives to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -35,3 +42,4 @@ jobs:
             ../${{ steps.version.outputs.short_tag }}.tar.zst
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
