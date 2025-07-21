@@ -2,9 +2,11 @@ name: Zstd Archive Release
 
 on:
   push:
+    # Match semver tags like v1.2.3
     tags:
-      - 'v*.*.*' # match v1.2.3, v10.20.30, etc.
-  workflow_dispatch: # allow manual runs
+      - 'v*.*.*'
+  # Allow manual runs from the Actions UI
+  workflow_dispatch:
 
 jobs:
   release:
@@ -15,31 +17,37 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install zstd
-        run: sudo apt-get update && sudo apt-get install -y zstd
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zstd
 
       - name: Extract version info
         id: version
         run: |
-          TAG_NAME="${GITHUB_REF#refs/tags/}" # e.g. v1.2.3
-          SHORT_TAG="${TAG_NAME#v}" # strip leading "v" → 1.2.3
+          # If triggered by a tag push, GITHUB_REF is refs/tags/vX.Y.Z
+          TAG_NAME="${GITHUB_REF#refs/tags/}"
+          SHORT_TAG="${TAG_NAME#v}" # strip leading "v"
           echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
           echo "short_tag=$SHORT_TAG" >> $GITHUB_OUTPUT
 
-      - name: Create .tar.zst archives using git archive
+      - name: Create .tar.zst archives
         run: |
-          git archive --format=tar --prefix=test-definitions/ ${{ steps.version.outputs.tag_name }} \
-            | zstd -o ../${{ steps.version.outputs.tag_name }}.tar.zst
-          git archive --format=tar --prefix=test-definitions/ ${{ steps.version.outputs.tag_name }} \
-            | zstd -o ../${{ steps.version.outputs.short_tag }}.tar.zst
+          # full-tag archive (vX.Y.Z.tar.zst)
+          git archive --format=tar \
+            --prefix=test-definitions/ \
+            "${{ steps.version.outputs.tag_name }}" \
+          | zstd -o "$GITHUB_WORKSPACE/${{ steps.version.outputs.tag_name }}.tar.zst"
+
+          # short-tag archive (X.Y.Z.tar.zst)
+          git archive --format=tar \
+            --prefix=test-definitions/ \
+            "${{ steps.version.outputs.tag_name }}" \
+          | zstd -o "$GITHUB_WORKSPACE/${{ steps.version.outputs.short_tag }}.tar.zst"
 
       - name: Upload .tar.zst archives to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.version.outputs.tag_name }}
-          name: Release ${{ steps.version.outputs.tag_name }}
-          files: |
-            ../${{ steps.version.outputs.tag_name }}.tar.zst
-            ../${{ steps.version.outputs.short_tag }}.tar.zst
+          # Pick up both .tar.zst files at the workspace root
+          files: '*.tar.zst'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
