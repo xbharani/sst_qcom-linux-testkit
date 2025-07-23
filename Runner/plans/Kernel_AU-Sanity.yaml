@@ -1,0 +1,83 @@
+metadata:
+    format: Lava-Test Test Definition 1.0
+    name: AUSanity
+    description: "Baseline AU Sanity test plan"
+    maintainer:
+        - vnarapar@qti.qualcomm.com
+    os:
+        - openembedded
+    scope:
+        - functional
+    devices:
+        - rb3gen2/rideSX
+
+run:
+    steps:
+        - cd Runner
+        - $PWD/suites/Kernel/Baseport/adsp_remoteproc/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/adsp_remoteproc/adsp_remoteproc.res || true
+        - $PWD/suites/Kernel/Baseport/cdsp_remoteproc/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/cdsp_remoteproc/cdsp_remoteproc.res || true
+        - $PWD/suites/Kernel/Baseport/CPUFreq_Validation/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/CPUFreq_Validation/CPUFreq_Validation.res || true
+        - $PWD/suites/Kernel/Baseport/GIC/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/GIC/GIC.res || true
+        - $PWD/suites/Kernel/Baseport/hotplug/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/hotplug/hotplug.res || true
+        - $PWD/suites/Kernel/Baseport/Interrupts/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/Interrupts/Interrupts.res || true
+        - $PWD/suites/Kernel/Baseport/irq/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/irq/irq.res || true
+        - $PWD/suites/Kernel/Baseport/kaslr/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/kaslr/kaslr.res || true
+        - $PWD/suites/Kernel/Baseport/MEMLAT/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/MEMLAT/MEMLAT.res || true
+        - $PWD/suites/Kernel/Baseport/pinctrl/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/pinctrl/pinctrl.res || true
+        - $PWD/suites/Kernel/Baseport/Reboot_health_check/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/Reboot_health_check/Reboot_health_check.res || true
+        - $PWD/suites/Kernel/Baseport/remoteproc/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/remoteproc/remoteproc.res || true
+        - $PWD/suites/Kernel/Baseport/RMNET/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/RMNET/RMNET.res || true
+        - $PWD/suites/Kernel/Baseport/IPA/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/IPA/IPA.res || true
+        - $PWD/suites/Kernel/Baseport/Probe_Failure_Check/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/Probe_Failure_Check/Probe_Failure_Check.res || true
+        - $PWD/suites/Kernel/Baseport/rngtest/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/rngtest/rngtest.res || true
+        - $PWD/suites/Kernel/Baseport/smmu/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/smmu/smmu.res || true
+        - $PWD/suites/Kernel/Baseport/storage/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/storage/storage.res || true
+        - $PWD/suites/Kernel/Baseport/wpss_remoteproc/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/wpss_remoteproc/wpss_remoteproc.res || true
+        - $PWD/suites/Kernel/DCVS/Freq_Scaling/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/DCVS/Freq_Scaling/Freq_Scaling.res || true
+        - $PWD/suites/Kernel/Scheduler/CPU_affinity/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Scheduler/CPU_affinity/CPU_affinity.res || true
+        - $PWD/suites/Kernel/Baseport/PCIe/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/PCIe/PCIe.res || true
+        - $PWD/suites/Kernel/Baseport/USBHost/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/USBHost/USBHost.res || true
+        - $PWD/suites/Kernel/Baseport/shmbridge/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/shmbridge/shmbridge.res || true
+        - $PWD/suites/Connectivity/Ethernet/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Connectivity/Ethernet/Ethernet.res || true
+        - $PWD/suites/Multimedia/Graphics/KMSCube/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Multimedia/Graphics/KMSCube/KMSCube.res || true
+        - $PWD/suites/Multimedia/Graphics/weston-simple-egl/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Multimedia/Graphics/weston-simple-egl/weston-simple-egl.res || true
+        - $PWD/suites/Multimedia/Audio/AudioPlayback/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Multimedia/Audio/AudioPlayback/AudioPlayback.res || true
+        - $PWD/suites/Multimedia/Audio/AudioRecord/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Multimedia/Audio/AudioRecord/AudioRecord.res || true
+        - $PWD/suites/Connectivity/Bluetooth/BT_ON_FF/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Connectivity/Bluetooth/BT_ON_FF/BT_ON_FF.res || true
+        - $PWD/suites/Connectivity/Bluetooth/BT_SCAN_PAIR/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Connectivity/Bluetooth/BT_SCAN_PAIR/BT_SCAN_PAIR.res || true
+        - $PWD/suites/Multimedia/Video/iris_v4l2_video_decode/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Multimedia/Video/iris_v4l2_video_decode/iris_v4l2_video_decode.res || true
+        - $PWD/suites/Multimedia/Video/iris_v4l2_video_encode/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Multimedia/Video/iris_v4l2_video_encode/iris_v4l2_video_encode.res || true
+        - $PWD/utils/result_parse.sh
