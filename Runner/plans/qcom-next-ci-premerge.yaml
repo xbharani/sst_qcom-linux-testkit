@@ -62,6 +62,6 @@ run:
         - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/USBHost/USBHost.res || true
         - $PWD/suites/Kernel/Baseport/shmbridge/run.sh || true
         - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/shmbridge/shmbridge.res || true
-        - $PWD/suites/Connectivity/Ethernet/Ethernet/run.sh || true
+        - $PWD/suites/Connectivity/Ethernet/run.sh || true
         - $PWD/utils/send-to-lava.sh $PWD/suites/Connectivity/Ethernet/Ethernet.res || true
         - $PWD/utils/result_parse.sh
