@@ -27,14 +27,14 @@ fi
 # Always source functestlib.sh, using $TOOLS exported by init_env
 # shellcheck disable=SC1090,SC1091
 . "$TOOLS/functestlib.sh"
- 
+
 TESTNAME="adsp_remoteproc"
 RES_FILE="./$TESTNAME.res"
 FW="adsp"
 
 test_path=$(find_test_case_by_name "$TESTNAME")
 cd "$test_path" || exit 1
- 
+
 log_info "-----------------------------------------------------------------------------------------"
 log_info "------------------- Starting $TESTNAME Testcase ----------------------------"
 log_info "=== Test Initialization ==="
@@ -59,7 +59,8 @@ fi
 # get_remoteproc_by_firmware prints: "path|state|firmware|name"
 entries="$(get_remoteproc_by_firmware "$FW" "" all)" || entries=""
 if [ -z "$entries" ]; then
-    fail_and_exit "$FW present in DT but no /sys/class/remoteproc entry found"
+    log_fail "$FW present in DT but no /sys/class/remoteproc entry found"
+    exit 1
 fi
 
 count_instances=$(printf '%s\n' "$entries" | wc -l)

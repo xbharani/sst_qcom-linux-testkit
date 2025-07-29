@@ -2,6 +2,7 @@
 
 # Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 # SPDX-License-Identifier: BSD-3-Clause-Clear
+#
 # Robustly find and source init_env
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 INIT_ENV=""
@@ -27,7 +28,7 @@ fi
 # Always source functestlib.sh, using $TOOLS exported by init_env
 # shellcheck disable=SC1090,SC1091
 . "$TOOLS/functestlib.sh"
- 
+
 TESTNAME="wpss_remoteproc"
 FW="wpss"
 RES_FILE="./$TESTNAME.res"
@@ -174,7 +175,9 @@ else
     else
         # If DT said WPSS present but neither remoteproc nor driver -> FAIL
         if [ "$dt_says_present" -eq 1 ]; then
-            fail_and_exit "DT lists $FW but no remoteproc and ath11k not loaded"
+            log_fail "DT lists $FW but no remoteproc and ath11k not loaded"
+            echo "$TESTNAME FAIL" >"$RES_FILE"
+            exit 1
         fi
         log_skip "$TESTNAME SKIP – neither remoteproc nor ath11k path available"
         echo "$TESTNAME SKIP" >"$RES_FILE"
@@ -200,6 +203,7 @@ if [ -e "$1" ]; then
 else
     log_info "No wlan interface yet (maybe not brought up)"
 fi
+
 # Final result for driver path: PASS if we got here
 log_pass "WPSS driver path checks passed"
 echo "$TESTNAME PASS" >"$RES_FILE"

@@ -28,14 +28,14 @@ fi
 # Always source functestlib.sh, using $TOOLS exported by init_env
 # shellcheck disable=SC1090,SC1091
 . "$TOOLS/functestlib.sh"
- 
+
 TESTNAME="gpdsp_remoteproc"
 RES_FILE="./$TESTNAME.res"
 FW="gpdsp"
 
 test_path=$(find_test_case_by_name "$TESTNAME")
 cd "$test_path" || exit 1
- 
+
 log_info "-----------------------------------------------------------------------------------------"
 log_info "------------------- Starting $TESTNAME Testcase ----------------------------"
 log_info "=== Test Initialization ==="
