@@ -1200,7 +1200,7 @@ dump_rproc_logs() {
     logfile="rproc_${base}_${label}_${ts}.log"
     log_info "Dumping ${base} [${label}] → ${logfile}"
     [ -r "$rpath/trace" ] && cat "$rpath/trace" >"$logfile"
-    dmesg --ctime | grep -i "$base" >>"$logfile" 2>/dev/null || :
+    dmesg | grep -i "$base" >>"$logfile" 2>/dev/null || :
 }
 
 # find_rpmsg_ctrl_for <short-name>
