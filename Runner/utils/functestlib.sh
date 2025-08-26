@@ -507,14 +507,25 @@ get_ip_address() {
 # Run a command with a timeout (in seconds)
 run_with_timeout() {
     timeout="$1"; shift
-    ( "$@" ) &
-    pid=$!
-    ( sleep "$timeout"; kill "$pid" 2>/dev/null ) &
-    watcher=$!
-    wait $pid 2>/dev/null
-    status=$?
-    kill $watcher 2>/dev/null
-    return $status
+    [ -z "$timeout" ] && { "$@"; return $?; }
+ 
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "$timeout" "$@"
+        return $?
+    fi
+ 
+    # fallback if coreutils timeout is missing
+    (
+        "$@" &
+        pid=$!
+        ( sleep "$timeout"; kill "$pid" 2>/dev/null ) &
+        watcher=$!
+        wait $pid 2>/dev/null
+        status=$?
+        kill $watcher 2>/dev/null
+        exit $status
+    )
+    return $?
 }
 
 # DHCP client logic (dhclient and udhcpc with timeouts)

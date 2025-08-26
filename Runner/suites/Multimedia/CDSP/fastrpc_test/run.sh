@@ -43,7 +43,7 @@ usage() {
 Usage: $0 [OPTIONS]
 
 Options:
-  --arch <name> Architecture (auto-detected if omitted)
+  --arch <name> Architecture (only if explicitly provided)
   --bin-dir <path> Directory containing 'fastrpc_test' binary
   --assets-dir <path> Directory that CONTAINS 'linux/' (run from here if present)
   --repeat <N> Number of test repetitions (default: 1)
@@ -54,7 +54,7 @@ Options:
 Notes:
 - If --bin-dir is omitted, 'fastrpc_test' must be on PATH.
 - If --assets-dir is omitted or lacks 'linux/', we run from the binary's dir.
-- Uses stdbuf/script if available for unbuffered output; otherwise runs plain.
+- If --arch is omitted, the -a flag is not passed at all.
 EOF
 }
 
@@ -66,7 +66,7 @@ while [ $# -gt 0 ]; do
         --assets-dir) ASSETS_DIR="$2"; shift 2 ;;
         --repeat) REPEAT="$2"; shift 2 ;;
         --timeout) TIMEOUT="$2"; shift 2 ;;
-        --verbose) VERBOSE=1; shift ;; # actively used below
+        --verbose) VERBOSE=1; shift ;;
         --help) usage; exit 0 ;;
         *) echo "[ERROR] Unknown argument: $1" >&2; usage; exit 1 ;;
     esac
@@ -81,7 +81,7 @@ fi
 test_path="$(find_test_case_by_name "$TESTNAME")"
 cd "$test_path" || exit 1
 
-log_info "-----------------------------------------------------------------------------------------"
+log_info "--------------------------------------------------------------------------"
 log_info "-------------------Starting $TESTNAME Testcase----------------------------"
 
 # Small debug helper
@@ -105,15 +105,18 @@ fi
 BINDIR="$(dirname "$FASTBIN")"
 log_info "Binary: $FASTBIN"
 
-# ---------- Arch detection if needed ----------
-if [ -z "$ARCH" ]; then
-    soc="$(cat /sys/devices/soc0/soc_id 2>/dev/null || echo "unknown")"
-    case "$soc" in
-        498) ARCH="v68" ;;
-        676|534) ARCH="v73" ;;
-        606) ARCH="v75" ;;
-        *) log_warn "Unknown SoC ID: $soc; defaulting to 'v68'"; ARCH="v68" ;;
-    esac
+# Extra binary info for debugging
+log_info "Binary details:"
+log_info " ls -l: $(ls -l "$FASTBIN" 2>/dev/null || echo 'N/A')"
+log_info " file : $(file "$FASTBIN" 2>/dev/null || echo 'N/A')"
+
+# ---------- Optional arch argument ----------
+ARCH_OPT=""
+if [ -n "$ARCH" ]; then
+    ARCH_OPT="-a $ARCH"
+    log_info "Arch option provided: $ARCH"
+else
+    log_info "No --arch provided; running without -a"
 fi
 
 # ---------- Buffering tool availability ----------
@@ -131,66 +134,27 @@ fi
 # ---------- Assets directory resolution ----------
 RESOLVED_RUN_DIR=""
 if [ -n "$ASSETS_DIR" ]; then
-    # Use user-provided assets dir if it exists; prefer it if it has linux/
     if [ -d "$ASSETS_DIR" ]; then
         RESOLVED_RUN_DIR="$ASSETS_DIR"
-        if [ ! -d "$ASSETS_DIR/linux" ]; then
-            log_debug "--assets-dir provided but no 'linux/' inside: $ASSETS_DIR (continuing anyway)"
-        else
+        if [ -d "$ASSETS_DIR/linux" ]; then
             log_info "Using --assets-dir: $ASSETS_DIR (expects: $ASSETS_DIR/linux)"
+        else
+            log_debug "--assets-dir provided but no 'linux/' inside: $ASSETS_DIR"
         fi
     else
         log_warn "--assets-dir not found: $ASSETS_DIR (falling back to binary dir)"
     fi
 fi
-
 if [ -z "$RESOLVED_RUN_DIR" ]; then
     if [ -d "$BINDIR/linux" ]; then
         RESOLVED_RUN_DIR="$BINDIR"
     elif [ -d "$SCRIPT_DIR/linux" ]; then
         RESOLVED_RUN_DIR="$SCRIPT_DIR"
     else
-        # Last resort: run from the binary directory
         RESOLVED_RUN_DIR="$BINDIR"
     fi
 fi
-
-# Quiet note if linux/ missing (don’t spam CI output)
-[ -d "$RESOLVED_RUN_DIR/linux" ] || log_debug "No 'linux/' under run dir: $RESOLVED_RUN_DIR (binary may still work)"
-
-# ---------- Timeout wrapper (portable fallback) ----------
-run_with_timeout() {
-    # Usage: run_with_timeout <timeout_sec_or_empty> -- <cmd> [args...]
-    tmo="$1"; shift
-    [ "$1" = "--" ] && shift
-    if [ -n "$tmo" ] && [ $HAVE_TIMEOUT -eq 1 ]; then
-        timeout "$tmo" "$@"
-        return $?
-    fi
-
-    if [ -z "$tmo" ]; then
-        "$@"
-        return $?
-    fi
-
-    # Fallback: crude timeout using a watcher
-    (
-        setsid "$@" &
-        child=$!
-        (
-            sleep "$tmo"
-            if kill -0 "$child" 2>/dev/null; then
-                # shellcheck disable=SC2046
-                kill -TERM -$(ps -o pgid= "$child" | tr -d ' ') 2>/dev/null
-            fi
-        ) &
-        watcher=$!
-        wait "$child"; rc=$?
-        kill "$watcher" 2>/dev/null
-        exit $rc
-    )
-    return $?
-}
+[ -d "$RESOLVED_RUN_DIR/linux" ] || log_debug "No 'linux/' under run dir: $RESOLVED_RUN_DIR"
 
 # ---------- Logging root ----------
 TS="$(date +%Y%m%d-%H%M%S)"
@@ -198,7 +162,7 @@ LOG_ROOT="./logs_${TESTNAME}_${TS}"
 mkdir -p "$LOG_ROOT" || { log_error "Cannot create $LOG_ROOT"; echo "$TESTNAME : FAIL" >"$RESULT_FILE"; exit 1; }
 
 tmo_label="none"; [ -n "$TIMEOUT" ] && tmo_label="${TIMEOUT}s"
-log_info "Arch: $ARCH | Repeats: $REPEAT | Timeout: $tmo_label | Buffering: $buf_label"
+log_info "Repeats: $REPEAT | Timeout: $tmo_label | Buffering: $buf_label"
 log_debug "Run dir: $RESOLVED_RUN_DIR | PATH=$PATH"
 
 # ---------- Run loop ----------
@@ -212,34 +176,36 @@ while [ "$i" -le "$REPEAT" ]; do
 
     log_info "Running $iter_tag/$REPEAT | start: $iso_now | dir: $RESOLVED_RUN_DIR"
 
-    # Execute from the chosen directory so binary can discover local deps
+    # Build command string for debug only
+    CMD="$FASTBIN -d 3 -U 1 -t linux $ARCH_OPT"
+    log_info "Executing: $CMD"
+
     if [ $HAVE_STDBUF -eq 1 ]; then
         (
             cd "$RESOLVED_RUN_DIR" || exit 127
-            run_with_timeout "$TIMEOUT" -- stdbuf -oL -eL "$FASTBIN" -d 3 -U 1 -t linux -a "$ARCH"
+            run_with_timeout "$TIMEOUT" stdbuf -oL -eL "$FASTBIN" -d 3 -U 1 -t linux "$ARCH_OPT"
         ) >"$iter_log" 2>&1
         rc=$?
     elif [ $HAVE_SCRIPT -eq 1 ]; then
         (
             cd "$RESOLVED_RUN_DIR" || exit 127
             if [ -n "$TIMEOUT" ] && [ $HAVE_TIMEOUT -eq 1 ]; then
-                script -q -c "timeout $TIMEOUT \"$FASTBIN\" -d 3 -U 1 -t linux -a \"$ARCH\"" /dev/null
+                script -q -c "timeout $TIMEOUT $CMD" /dev/null
             else
-                script -q -c "\"$FASTBIN\" -d 3 -U 1 -t linux -a \"$ARCH\"" /dev/null
+                script -q -c "$CMD" /dev/null
             fi
         ) >"$iter_log" 2>&1
         rc=$?
     else
         (
             cd "$RESOLVED_RUN_DIR" || exit 127
-            run_with_timeout "$TIMEOUT" -- "$FASTBIN" -d 3 -U 1 -t linux -a "$ARCH"
+            run_with_timeout "$TIMEOUT" "$FASTBIN" -d 3 -U 1 -t linux "$ARCH_OPT"
         ) >"$iter_log" 2>&1
         rc=$?
     fi
 
     printf '%s\n' "$rc" >"$iter_rc"
 
-    # Stream the iteration output to console (compact)
     if [ -s "$iter_log" ]; then
         echo "----- $iter_tag output begin -----"
         cat "$iter_log"
