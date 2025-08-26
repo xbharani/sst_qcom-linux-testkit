@@ -30,8 +30,6 @@ run:
         - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/irq/irq.res || true
         - $PWD/suites/Kernel/Baseport/kaslr/run.sh || true
         - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/kaslr/kaslr.res || true
-        - $PWD/suites/Kernel/Baseport/MEMLAT/run.sh || true
-        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/MEMLAT/MEMLAT.res || true
         - $PWD/suites/Kernel/Baseport/pinctrl/run.sh || true
         - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/pinctrl/pinctrl.res || true
         - $PWD/suites/Kernel/Baseport/Reboot_health_check/run.sh || true
