@@ -53,8 +53,9 @@ Options:
   --help Show this help
 
 Notes:
-- If --bin-dir is omitted, 'fastrpc_test' must be on PATH or in known fallback paths.
-- Default assets location prefers \$BINDIR/linux (so /usr/bin/linux in your layout).
+- Default binary path is /usr/bin/fastrpc_test.
+- /bin/fastrpc_test is used ONLY if ALLOW_BIN_FASTRPC=1 or you pass --bin-dir /bin.
+- Default assets location prefers \$BINDIR/linux (so /usr/bin/linux).
 - If --arch is omitted, the -a flag is not passed at all.
 EOF
 }
@@ -97,18 +98,18 @@ log_info "-------------------Starting $TESTNAME Testcase------------------------
 # Small debug helper
 log_debug() { [ "$VERBOSE" -eq 1 ] && log_info "[debug] $*"; }
 
-# -------------------- Binary detection (robust) -----------------
+# -------------------- Binary detection (default: /usr/bin) ----------------
 FASTBIN=""
-if [ -n "$BIN_DIR" ]; then
+if [ -n "$BIN_DIR" ] && [ -x "$BIN_DIR/fastrpc_test" ]; then
+    # Explicit override wins
     FASTBIN="$BIN_DIR/fastrpc_test"
-elif command -v fastrpc_test >/dev/null 2>&1; then
-    FASTBIN="$(command -v fastrpc_test)"
-elif [ -x "/usr/bin/fastrpc_test" ]; then
+elif [ -x /usr/bin/fastrpc_test ]; then
     FASTBIN="/usr/bin/fastrpc_test"
-elif [ -x "/opt/qcom/bin/fastrpc_test" ]; then
-    FASTBIN="/opt/qcom/bin/fastrpc_test"
+elif [ -x /bin/fastrpc_test ] && [ "${ALLOW_BIN_FASTRPC:-0}" = "1" ]; then
+    FASTBIN="/bin/fastrpc_test"
+    log_warn "ALLOW_BIN_FASTRPC=1: using /bin/fastrpc_test"
 else
-    log_fail "'fastrpc_test' not found (try --bin-dir or ensure PATH includes /usr/bin)."
+    log_fail "'fastrpc_test' not found in /usr/bin. Pass --bin-dir <dir> (or ALLOW_BIN_FASTRPC=1 to allow /bin)."
     echo "$TESTNAME : FAIL" >"$RESULT_FILE"
     exit 1
 fi
@@ -150,34 +151,19 @@ elif [ $HAVE_SCRIPT -eq 1 ]; then
 fi
 
 # ---------------- Assets directory resolution ------------------
-# Default must prefer $BINDIR/linux (e.g., /usr/bin/linux)
-: "${FASTRPC_ASSETS_DIR:=}"
+# Prefer $BINDIR/linux (e.g., /usr/bin/linux); allow explicit --assets-dir.
 RESOLVED_RUN_DIR=""
-
-# Priority: explicit flags/env → alongside binary → script dir → FHS-ish fallbacks
-CANDIDATES="
-${ASSETS_DIR}
-${FASTRPC_ASSETS_DIR}
-${BINDIR}
-${SCRIPT_DIR}
-${BINDIR%/bin}/share/fastrpc_test
-/usr/share/fastrpc_test
-/usr/lib/fastrpc_test
-"
-
-for d in $CANDIDATES; do
-    [ -n "$d" ] || continue
-    if [ -d "$d/linux" ]; then
-        RESOLVED_RUN_DIR="$d"
-        break
-    fi
-done
-
-if [ -n "$RESOLVED_RUN_DIR" ]; then
-    log_info "Assets dir: $RESOLVED_RUN_DIR (found 'linux/')"
+if [ -n "$ASSETS_DIR" ] && [ -d "$ASSETS_DIR/linux" ]; then
+    RESOLVED_RUN_DIR="$ASSETS_DIR"
+elif [ -d /usr/bin/linux ]; then
+    RESOLVED_RUN_DIR="/usr/bin"
+elif [ -d "$BINDIR/linux" ]; then
+    RESOLVED_RUN_DIR="$BINDIR"
+elif [ -d "$SCRIPT_DIR/linux" ]; then
+    RESOLVED_RUN_DIR="$SCRIPT_DIR"
 else
     RESOLVED_RUN_DIR="$BINDIR"
-    log_warn "No 'linux/' assets found; continuing from $RESOLVED_RUN_DIR"
+    log_warn "No 'linux/' assets found; running from $RESOLVED_RUN_DIR"
 fi
 
 # -------------------- Logging root -----------------------------
@@ -187,7 +173,8 @@ mkdir -p "$LOG_ROOT" || { log_error "Cannot create $LOG_ROOT"; echo "$TESTNAME :
 
 tmo_label="none"; [ -n "$TIMEOUT" ] && tmo_label="${TIMEOUT}s"
 log_info "Repeats: $REPEAT | Timeout: $tmo_label | Buffering: $buf_label"
-log_debug "Run dir: $RESOLVED_RUN_DIR"
+log_info "Run dir: $RESOLVED_RUN_DIR"
+log_debug "Run dir has linux?: $( [ -d "$RESOLVED_RUN_DIR/linux" ] && echo yes || echo no )"
 
 # -------------------- Run loop ---------------------------------
 PASS_COUNT=0
