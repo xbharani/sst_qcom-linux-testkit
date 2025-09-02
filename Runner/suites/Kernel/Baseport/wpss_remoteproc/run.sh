@@ -33,6 +33,12 @@ TESTNAME="wpss_remoteproc"
 FW="wpss"
 RES_FILE="./$TESTNAME.res"
 
+# Run from the testcase directory so relative outputs (like .res) land next to run.sh
+test_path="$(find_test_case_by_name "$TESTNAME")"
+cd "$test_path" || {
+    echo "[ERROR] Could not cd to testcase path: $test_path" >&2
+    exit 1
+}
 log_info "-----------------------------------------------------------------------------------------"
 log_info "------------------- Starting $TESTNAME Testcase ----------------------------"
 log_info "=== Test Initialization ==="
