@@ -49,21 +49,20 @@ Runner/
 Usage: run.sh [OPTIONS]
 
 Options:
-  --arch <name>        Architecture (auto-detected from SoC if omitted)
-  --bin-dir <path>     Directory that contains the 'fastrpc_test' binary
-  --assets-dir <path>  Directory that CONTAINS 'linux/' (libs/assets parent)
-  --repeat <N>         Number of iterations (default: 1)
-  --timeout <sec>      Timeout per run (no timeout if omitted)
-  --verbose            Extra logging for CI debugging
-  --help               Show this help
+  --arch <name> Architecture (only if explicitly provided)
+  --bin-dir <path> Directory containing 'fastrpc_test' (default: /usr/bin)
+  --assets-dir <path> Directory that CONTAINS 'linux/' (info only; we run from the binary dir)
+  --user-pd Use '-U 1' (user/unsigned PD). Default is '-U 0'.
+  --repeat <N> Number of repetitions (default: 1)
+  --timeout <sec> Timeout for each run (no timeout if omitted)
+  --verbose Extra logging for CI debugging
+  --help Show this help
 
-Binary & assets resolution (in order):
-  Binary:   1) --bin-dir  2) $PATH (command -v fastrpc_test)
-  Assets:   1) --assets-dir
-            2) <bin-dir> (if provided)
-            3) directory of resolved binary
-            4) directory of this run.sh
-            5) common locations: /usr/share/bin, /usr/share/fastrpc, /opt/fastrpc
+Env:
+  FASTRPC_USER_PD=0|1 Sets PD (-U value). CLI --user-pd overrides to 1.
+  FASTRPC_EXTRA_FLAGS Extra flags appended to the command.
+  ALLOW_BIN_FASTRPC=1 Permit using /bin/fastrpc_test (otherwise refused).
+
 The test executes FROM the assets directory so 'fastrpc_test' can find deps.
 ```
 
@@ -77,36 +76,70 @@ The test executes FROM the assets directory so 'fastrpc_test' can find deps.
 ### Common scenarios
 
 ```bash
-# 1) Binary in a custom folder; assets are alongside it (i.e., that folder has linux/)
-./run.sh --bin-dir /opt/qcom/fastrpc --repeat 5
+# Default expects /usr/bin/fastrpc_test and /usr/bin/linux
+./run.sh
 
-# 2) Binary in PATH; assets somewhere else
-./run.sh --assets-dir /opt/qcom/fastrpc_assets --timeout 45
+Common scenarios
 
-# 3) Both explicitly provided (most deterministic)
-./run.sh --bin-dir /opt/qcom/fastrpc/bin --assets-dir /opt/qcom/fastrpc --arch v75 --repeat 10 --timeout 30 --verbose
+# 1) Use a custom binary directory (we will cd there and run ./fastrpc_test)
+./run.sh --bin-dir /tmp/stage/usr/bin
 
-# 4) Force architecture (skip SoC autodetect)
-./run.sh --arch v68
+# 2) Opt into user/unsigned PD (-U 1)
+./run.sh --user-pd
+# or via env
+FASTRPC_USER_PD=1 ./run.sh
+
+# 3) Add extra flags (kept intact; -U is appended last as '-U 0/1')
+FASTRPC_EXTRA_FLAGS="-d 3" ./run.sh
+
+# 4) Allow /bin explicitly (generally discouraged unless required)
+ALLOW_BIN_FASTRPC=1 ./run.sh --bin-dir /bin
+
+# 5) Run multiple iterations with a timeout and verbose logs
+./run.sh --repeat 3 --timeout 120 --verbose
+
+Force CDSP explicitly:
+  
+# 6) ./run.sh --domain 3
+# or
+# 6) ./run.sh --domain-name cdsp
+ 
+Use ADSP and user PD:
+  
+# 7) ./run.sh --domain-name adsp --user-pd
+ 
+From env (CI):
+ 
+FASTRPC_DOMAIN=2 FASTRPC_USER_PD=1 ./run.sh
+# => SDSP with -U 1
+```
+
+### LAVA integration example
+
+```
+- $PWD/suites/Multimedia/CDSP/fastrpc_test/run.sh --bin-dir /usr/bin || true
+- $PWD/utils/send-to-lava.sh $PWD/suites/Multimedia/CDSP/fastrpc_test/fastrpc_test.res || true
 ```
 
 ### Sample output (trimmed)
 
 ```
-[INFO] 2025-08-13 09:12:01 - -------------------Starting fastrpc_test Testcase----------------------------
-[INFO] 2025-08-13 09:12:01 - Buffering: stdbuf -oL -eL | Timeout: 60 sec | Arch: v68
-[INFO] 2025-08-13 09:12:01 - Resolved binary: /usr/bin/fastrpc_test
-[INFO] 2025-08-13 09:12:01 - Assets dir: /usr/bin (linux/ expected here)
-[INFO] 2025-08-13 09:12:01 - Running iter1/3 | start: 2025-08-13T09:12:01Z | cmd: fastrpc_test -d 3 -U 1 -t linux -a v68
+[INFO] 2025-09-02 10:44:46 - -------------------Starting fastrpc_test Testcase----------------------------
+[INFO] 2025-09-02 10:44:46 - Using binary: /usr/bin/fastrpc_test
+[INFO] 2025-09-02 10:44:46 - PD setting: -U 0 (use --user-pd to set -U 1)
+[INFO] 2025-09-02 10:44:46 - Run dir: /usr/bin (launching ./fastrpc_test)
+[INFO] 2025-09-02 10:44:46 - Executing: ./fastrpc_test -d 3 -t linux -U 0
+----- iter1 output begin -----
 ... fastrpc_test output ...
-[PASS] 2025-08-13 09:12:05 - iter1: pattern matched
-[INFO] 2025-08-13 09:12:05 - Running iter2/3 | start: ...
-...
-[FAIL] 2025-08-13 09:12:15 - fastrpc_test : Test Failed (2/3) | logs: ./logs_fastrpc_test_20250813-091201
+----- iter1 output end -----
+[PASS] 2025-09-02 10:44:50 - iter1: success
+[PASS] 2025-09-02 10:44:50 - fastrpc_test : Test Passed (1/1)
 ```
 
 ## CI debugging aids
-
+- Binary resolved to /bin/fastrpc_test: By default this is blocked to avoid loader/ramdisk mismatches. Set ALLOW_BIN_FASTRPC=1 and/or --bin-dir /bin if you intentionally need it.
+- Error resolving path .../linux: Ensure linux/ is next to the binary (e.g., /usr/bin/linux). The script runs from the binary dir specifically to make this work.
+- Session create errors with -U 1: If you opt into user/unsigned PD and see 0x80000416, confirm your image includes unsigned shells/policies (or revert to the default -U 0).
 - Per-iteration logs: `logs_fastrpc_test_<timestamp>/iterN.out` (+ `iterN.rc`)
 - Summary result file: `fastrpc_test.res` (`PASS` / `FAIL`)
 - Verbose mode: adds environment, resolutions, and timing details

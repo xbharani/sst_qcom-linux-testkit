@@ -35,9 +35,12 @@ RESULT_FILE="$TESTNAME.res"
 REPEAT=1
 TIMEOUT=""
 ARCH=""
-BIN_DIR="" # optional: where fastrpc_test lives
-ASSETS_DIR="" # optional: parent containing linux/ etc
+BIN_DIR="" # directory that CONTAINS fastrpc_test
+ASSETS_DIR="" # informational; assets should be alongside binary (…/linux)
 VERBOSE=0
+USER_PD_FLAG=0 # default: -U 0 (system/signed PD)
+CLI_DOMAIN=""
+CLI_DOMAIN_NAME=""
 
 usage() {
     cat <<EOF
@@ -45,18 +48,27 @@ Usage: $0 [OPTIONS]
 
 Options:
   --arch <name> Architecture (only if explicitly provided)
-  --bin-dir <path> Directory containing 'fastrpc_test' binary
-  --assets-dir <path> Directory that CONTAINS 'linux/' (defaults to \$BINDIR, e.g. /usr/bin)
+  --bin-dir <path> Directory containing 'fastrpc_test' (default: /usr/bin)
+  --assets-dir <path> Directory that CONTAINS 'linux/' (info only)
+  --domain <0|1|2|3> DSP domain: 0=ADSP, 1=MDSP, 2=SDSP, 3=CDSP
+  --domain-name <name> DSP domain by name: adsp|mdsp|sdsp|cdsp
+  --user-pd Use '-U 1' (user/unsigned PD). Default is '-U 0'
   --repeat <N> Number of repetitions (default: 1)
   --timeout <sec> Timeout for each run (no timeout if omitted)
   --verbose Extra logging for CI debugging
   --help Show this help
 
+Env:
+  FASTRPC_DOMAIN=0|1|2|3 Sets domain; CLI --domain/--domain-name wins.
+  FASTRPC_DOMAIN_NAME=adsp|... Named domain; CLI wins.
+  FASTRPC_USER_PD=0|1 Sets PD (-U value). CLI --user-pd overrides to 1.
+  FASTRPC_EXTRA_FLAGS Extra flags appended (space-separated).
+  ALLOW_BIN_FASTRPC=1 Permit using /bin/fastrpc_test when --bin-dir=/bin.
+
 Notes:
-- Default binary path is /usr/bin/fastrpc_test.
-- /bin/fastrpc_test is used ONLY if ALLOW_BIN_FASTRPC=1 or you pass --bin-dir /bin.
-- Default assets location prefers \$BINDIR/linux (so /usr/bin/linux).
-- If --arch is omitted, the -a flag is not passed at all.
+- Script *cd*s into the binary's directory and launches ./fastrpc_test so
+  'linux/' next to the binary (e.g. /usr/bin/linux) is discovered reliably.
+- If domain not provided, we auto-pick: CDSP if present; else ADSP; else SDSP; else 3.
 EOF
 }
 
@@ -66,6 +78,9 @@ while [ $# -gt 0 ]; do
         --arch) ARCH="$2"; shift 2 ;;
         --bin-dir) BIN_DIR="$2"; shift 2 ;;
         --assets-dir) ASSETS_DIR="$2"; shift 2 ;;
+        --domain) CLI_DOMAIN="$2"; shift 2 ;;
+        --domain-name) CLI_DOMAIN_NAME="$2"; shift 2 ;;
+        --user-pd) USER_PD_FLAG=1; shift ;;
         --repeat) REPEAT="$2"; shift 2 ;;
         --timeout) TIMEOUT="$2"; shift 2 ;;
         --verbose) VERBOSE=1; shift ;;
@@ -92,51 +107,165 @@ cd "$test_path" || {
     exit 1
 }
 
-log_info "--------------------------------------------------------------------------"
-log_info "-------------------Starting $TESTNAME Testcase----------------------------"
-
-# Small debug helper
+# -------------------- Helpers --------------------
 log_debug() { [ "$VERBOSE" -eq 1 ] && log_info "[debug] $*"; }
 
-# -------------------- Binary detection (default: /usr/bin) ----------------
-FASTBIN=""
-if [ -n "$BIN_DIR" ] && [ -x "$BIN_DIR/fastrpc_test" ]; then
-    # Explicit override wins
-    FASTBIN="$BIN_DIR/fastrpc_test"
-elif [ -x /usr/bin/fastrpc_test ]; then
-    FASTBIN="/usr/bin/fastrpc_test"
-elif [ -x /bin/fastrpc_test ] && [ "${ALLOW_BIN_FASTRPC:-0}" = "1" ]; then
-    FASTBIN="/bin/fastrpc_test"
-    log_warn "ALLOW_BIN_FASTRPC=1: using /bin/fastrpc_test"
+cmd_to_string() {
+    out=""
+    for a in "$@"; do
+        case "$a" in
+            *[!A-Za-z0-9._:/-]*|"")
+                q=$(printf "%s" "$a" | sed "s/'/'\\\\''/g")
+                out="$out '$q'"
+                ;;
+            *)
+                out="$out $a"
+                ;;
+        esac
+    done
+    printf "%s" "$out"
+}
+
+log_soc_info() {
+    m=""; s=""; pv=""
+    [ -r /sys/devices/soc0/machine ] && m="$(cat /sys/devices/soc0/machine 2>/dev/null)"
+    [ -r /sys/devices/soc0/soc_id ] && s="$(cat /sys/devices/soc0/soc_id 2>/dev/null)"
+    [ -r /sys/devices/soc0/platform_version ] && pv="$(cat /sys/devices/soc0/platform_version 2>/dev/null)"
+    [ -n "$m" ] && log_info "SoC.machine: $m"
+    [ -n "$s" ] && log_info "SoC.soc_id: $s"
+    [ -n "$pv" ] && log_info "SoC.platform_version: $pv"
+}
+
+log_dsp_remoteproc_status() {
+    fw_list="adsp cdsp cdsp0 cdsp1 sdsp gdsp0 gdsp1"
+    any=0
+    for fw in $fw_list; do
+        if dt_has_remoteproc_fw "$fw"; then
+            entries="$(get_remoteproc_by_firmware "$fw" "" all 2>/dev/null)" || entries=""
+            if [ -n "$entries" ]; then
+                any=1
+                while IFS='|' read -r rpath rstate rfirm rname; do
+                    [ -n "$rpath" ] || continue
+                    inst="$(basename "$rpath")"
+                    log_info "rproc.$fw: $inst path=$rpath state=$rstate fw=$rfirm name=$rname"
+                done <<__RPROC__
+$entries
+__RPROC__
+            fi
+        fi
+    done
+    [ $any -eq 0 ] && log_info "rproc: no *dsp remoteproc entries detected via DT"
+}
+
+name_to_domain() {
+    case "$(printf "%s" "$1" | tr '[:upper:]' '[:lower:]')" in
+        adsp) echo 0 ;;
+        mdsp) echo 1 ;;
+        sdsp) echo 2 ;;
+        cdsp) echo 3 ;;
+        *) echo "" ;;
+    esac
+}
+
+pick_default_domain() {
+    # Prefer CDSP if present; else ADSP; else SDSP; else 3
+    if dt_has_remoteproc_fw "cdsp" || dt_has_remoteproc_fw "cdsp0" || dt_has_remoteproc_fw "cdsp1"; then
+        echo 3; return
+    fi
+    if dt_has_remoteproc_fw "adsp"; then
+        echo 0; return
+    fi
+    if dt_has_remoteproc_fw "sdsp"; then
+        echo 2; return
+    fi
+    echo 3
+}
+
+# -------------------- Banner --------------------
+log_info "--------------------------------------------------------------------------"
+log_info "-------------------Starting $TESTNAME Testcase----------------------------"
+log_info "Kernel: $(uname -a 2>/dev/null || echo N/A)"
+log_info "Date(UTC): $(date -u 2>/dev/null || echo N/A)"
+log_soc_info
+
+# -------------------- Binary directory resolution -----------------
+if [ -n "$BIN_DIR" ]; then
+    :
 else
-    log_fail "'fastrpc_test' not found in /usr/bin. Pass --bin-dir <dir> (or ALLOW_BIN_FASTRPC=1 to allow /bin)."
+    BIN_DIR="/usr/bin"
+fi
+
+case "$BIN_DIR" in
+    /bin)
+        if [ "${ALLOW_BIN_FASTRPC:-0}" -ne 1 ]; then
+            log_fail "Refusing /bin by default (set ALLOW_BIN_FASTRPC=1 or use --bin-dir /usr/bin)"
+            echo "$TESTNAME : FAIL" >"$RESULT_FILE"
+            exit 1
+        fi
+    ;;
+esac
+
+RUN_DIR="$BIN_DIR"
+RUN_BIN="$RUN_DIR/fastrpc_test"
+
+if [ ! -x "$RUN_BIN" ]; then
+    log_fail "fastrpc_test not executable at: $RUN_BIN"
     echo "$TESTNAME : FAIL" >"$RESULT_FILE"
     exit 1
 fi
 
-if [ ! -x "$FASTBIN" ]; then
-    log_fail "Binary not executable: $FASTBIN"
-    echo "$TESTNAME : FAIL" >"$RESULT_FILE"
-    exit 1
+if [ -n "$ASSETS_DIR" ]; then
+    [ -d "$ASSETS_DIR/linux" ] || log_warn "--assets-dir provided but no 'linux/' inside: $ASSETS_DIR"
 fi
+[ -d "$RUN_DIR/linux" ] || log_warn "No 'linux/' under $RUN_DIR; the sample libs may be missing"
 
-BINDIR="$(dirname "$FASTBIN")"
-log_info "Using binary: $FASTBIN"
-log_debug "PATH=$PATH"
+log_info "Using binary: $RUN_BIN"
+log_info "Run dir: $RUN_DIR (launching ./fastrpc_test)"
 log_info "Binary details:"
-# shellcheck disable=SC2012
-log_info " ls -l: $(ls -l "$FASTBIN" 2>/dev/null || echo 'N/A')"
-log_info " file : $(file "$FASTBIN" 2>/dev/null || echo 'N/A')"
+log_info " ls -l: $(ls -l "$RUN_BIN" 2>/dev/null || echo 'N/A')"
+log_info " file : $(file "$RUN_BIN" 2>/dev/null || echo 'N/A')"
 
-# -------------------- Optional arch argument -------------------
-# Use positional params trick so we don't misquote "-a <arch>"
-set -- # clear "$@"
-if [ -n "$ARCH" ]; then
-    set -- -a "$ARCH"
-    log_info "Arch option: -a $ARCH"
-else
-    log_info "No --arch provided; running without -a"
+# Log *dsp remoteproc statuses via existing helpers
+log_dsp_remoteproc_status
+
+# -------------------- PD selection -------------------
+PD_VAL="${FASTRPC_USER_PD:-0}"
+[ "$USER_PD_FLAG" -eq 1 ] && PD_VAL=1
+log_info "PD setting: -U $PD_VAL (use --user-pd or FASTRPC_USER_PD=1 to change)"
+
+# -------------------- Domain selection -------------------
+DOMAIN=""
+# Precedence: CLI name -> CLI number -> env name -> env number -> auto-pick
+if [ -n "$CLI_DOMAIN_NAME" ]; then
+    DOMAIN="$(name_to_domain "$CLI_DOMAIN_NAME")"
+elif [ -n "$CLI_DOMAIN" ]; then
+    DOMAIN="$CLI_DOMAIN"
+elif [ -n "${FASTRPC_DOMAIN_NAME:-}" ]; then
+    DOMAIN="$(name_to_domain "$FASTRPC_DOMAIN_NAME")"
+elif [ -n "${FASTRPC_DOMAIN:-}" ]; then
+    DOMAIN="$FASTRPC_DOMAIN"
 fi
+
+# Validate / auto-pick
+case "$DOMAIN" in
+    0|1|2|3) : ;;
+    "" )
+        DOMAIN="$(pick_default_domain)"
+        log_info "Domain auto-picked: -d $DOMAIN (CDSP=3, ADSP=0, SDSP=2)"
+        ;;
+    * )
+        log_warn "Invalid domain '$DOMAIN'; auto-picking"
+        DOMAIN="$(pick_default_domain)"
+        ;;
+esac
+
+case "$DOMAIN" in
+    0) dom_name="ADSP" ;;
+    1) dom_name="MDSP" ;;
+    2) dom_name="SDSP" ;;
+    3) dom_name="CDSP" ;;
+esac
+log_info "Domain: -d $DOMAIN ($dom_name)"
 
 # -------------------- Buffering tool availability ---------------
 HAVE_STDBUF=0; command -v stdbuf >/dev/null 2>&1 && HAVE_STDBUF=1
@@ -150,20 +279,22 @@ elif [ $HAVE_SCRIPT -eq 1 ]; then
     buf_label="script -q"
 fi
 
-# ---------------- Assets directory resolution ------------------
-# Prefer $BINDIR/linux (e.g., /usr/bin/linux); allow explicit --assets-dir.
-RESOLVED_RUN_DIR=""
-if [ -n "$ASSETS_DIR" ] && [ -d "$ASSETS_DIR/linux" ]; then
-    RESOLVED_RUN_DIR="$ASSETS_DIR"
-elif [ -d /usr/bin/linux ]; then
-    RESOLVED_RUN_DIR="/usr/bin"
-elif [ -d "$BINDIR/linux" ]; then
-    RESOLVED_RUN_DIR="$BINDIR"
-elif [ -d "$SCRIPT_DIR/linux" ]; then
-    RESOLVED_RUN_DIR="$SCRIPT_DIR"
+# -------------------- Build argv safely -------------------------
+set -- -d "$DOMAIN" -t linux
+
+if [ -n "$ARCH" ]; then
+    set -- "$@" -a "$ARCH"
+    log_info "Arch option: -a $ARCH"
 else
-    RESOLVED_RUN_DIR="$BINDIR"
-    log_warn "No 'linux/' assets found; running from $RESOLVED_RUN_DIR"
+    log_info "No --arch provided; running without -a"
+fi
+
+set -- "$@" -U "$PD_VAL"
+
+if [ -n "$FASTRPC_EXTRA_FLAGS" ]; then
+    # shellcheck disable=SC2086
+    set -- "$@" $FASTRPC_EXTRA_FLAGS
+    log_info "Extra flags: $FASTRPC_EXTRA_FLAGS"
 fi
 
 # -------------------- Logging root -----------------------------
@@ -173,8 +304,6 @@ mkdir -p "$LOG_ROOT" || { log_error "Cannot create $LOG_ROOT"; echo "$TESTNAME :
 
 tmo_label="none"; [ -n "$TIMEOUT" ] && tmo_label="${TIMEOUT}s"
 log_info "Repeats: $REPEAT | Timeout: $tmo_label | Buffering: $buf_label"
-log_info "Run dir: $RESOLVED_RUN_DIR"
-log_debug "Run dir has linux?: $( [ -d "$RESOLVED_RUN_DIR/linux" ] && echo yes || echo no )"
 
 # -------------------- Run loop ---------------------------------
 PASS_COUNT=0
@@ -183,34 +312,41 @@ while [ "$i" -le "$REPEAT" ]; do
     iter_tag="iter$i"
     iter_log="$LOG_ROOT/${iter_tag}.out"
     iter_rc="$LOG_ROOT/${iter_tag}.rc"
+    iter_cmd="$LOG_ROOT/${iter_tag}.cmd"
+    iter_env="$LOG_ROOT/${iter_tag}.env"
+    iter_dmesg="$LOG_ROOT/${iter_tag}.dmesg"
     iso_now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
-    log_info "Running $iter_tag/$REPEAT | start: $iso_now | dir: $RESOLVED_RUN_DIR"
+    {
+        echo "DATE_UTC=$iso_now"
+        echo "RUN_DIR=$RUN_DIR"
+        echo "RUN_BIN=$RUN_BIN"
+        echo "PATH=$PATH"
+        echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}"
+        echo "ARCH=${ARCH:-}"
+        echo "PD_VAL=$PD_VAL"
+        echo "DOMAIN=$DOMAIN ($dom_name)"
+        echo "REPEAT=$REPEAT TIMEOUT=${TIMEOUT:-none}"
+        echo "EXTRA=$FASTRPC_EXTRA_FLAGS"
+    } > "$iter_env"
 
-    # Base command (for logging only)
-    # shellcheck disable=SC2145
-    log_info "Executing: $FASTBIN -d 3 -U 1 -t linux $*"
+    log_info "Running $iter_tag/$REPEAT | start: $iso_now | dir: $RUN_DIR"
+    log_info "Executing: ./fastrpc_test$(cmd_to_string "$@")"
+    printf "./fastrpc_test%s\n" "$(cmd_to_string "$@")" > "$iter_cmd"
 
-    rc=127
     (
-        cd "$RESOLVED_RUN_DIR" || exit 127
-
+        cd "$RUN_DIR" || exit 127
         if [ $HAVE_STDBUF -eq 1 ]; then
-            # Prefer line-buffered stdout/stderr when available
-            # run_with_timeout from functestlib.sh wraps timeout if TIMEOUT is set
-            run_with_timeout "$TIMEOUT" stdbuf -oL -eL "$FASTBIN" -d 3 -U 1 -t linux "$@"
-
+            run_with_timeout "$TIMEOUT" stdbuf -oL -eL ./fastrpc_test "$@"
         elif [ $HAVE_SCRIPT -eq 1 ]; then
-            # script(1) fallback to get unbuffered-ish output
+            cmd_str="./fastrpc_test$(cmd_to_string "$@")"
             if [ -n "$TIMEOUT" ] && [ $HAVE_TIMEOUT -eq 1 ]; then
-                script -q -c "timeout $TIMEOUT $FASTBIN -d 3 -U 1 -t linux $*" /dev/null
+                script -q -c "timeout $TIMEOUT $cmd_str" /dev/null
             else
-                script -q -c "$FASTBIN -d 3 -U 1 -t linux $*" /dev/null
+                script -q -c "$cmd_str" /dev/null
             fi
-
         else
-            # Plain execution (still via run_with_timeout if available)
-            run_with_timeout "$TIMEOUT" "$FASTBIN" -d 3 -U 1 -t linux "$@"
+            run_with_timeout "$TIMEOUT" ./fastrpc_test "$@"
         fi
     ) >"$iter_log" 2>&1
     rc=$?
@@ -225,6 +361,8 @@ while [ "$i" -le "$REPEAT" ]; do
 
     if [ "$rc" -ne 0 ]; then
         log_fail "$iter_tag: fastrpc_test exited $rc (see $iter_log)"
+        dmesg | tail -n 300 > "$iter_dmesg" 2>/dev/null
+        log_dsp_remoteproc_status
     fi
 
     if grep -q "All tests completed successfully" "$iter_log"; then
@@ -246,7 +384,6 @@ else
     echo "$TESTNAME : FAIL" > "$RESULT_FILE"
 fi
 
-# Failsafe: ensure the .res file exists for CI/LAVA consumption
 [ -f "$RESULT_FILE" ] || {
     log_error "Missing result file ($RESULT_FILE) — creating FAIL"
     echo "$TESTNAME : FAIL" >"$RESULT_FILE"
