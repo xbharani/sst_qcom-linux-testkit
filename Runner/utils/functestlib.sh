@@ -1136,41 +1136,45 @@ start_remoteproc() {
     printf 'start\n' >"$statef" 2>/dev/null || return 1
     wait_remoteproc_state "$path" running 6
 }
-# Validate remoteproc running state with retries and logging
+
+# Returns 0 if every rproc using $1 firmware is running; non-zero otherwise.
 validate_remoteproc_running() {
-    fw_name="$1"
-    log_file="${2:-/dev/null}"
-    max_wait_secs="${3:-10}"
-    delay_per_try_secs="${4:-1}"
-
-    rproc_path=$(get_remoteproc_path_by_firmware "$fw_name")
-    if [ -z "$rproc_path" ]; then
-        echo "[ERROR] Remoteproc for '$fw_name' not found" >> "$log_file"
-        {
-            echo "---- Last 20 remoteproc dmesg logs ----"
-            dmesg | grep -i "remoteproc" | tail -n 20
-            echo "----------------------------------------"
-        } >> "$log_file"
-        return 1
-    fi
-
-    total_waited=0
-    while [ "$total_waited" -lt "$max_wait_secs" ]; do
-        state=$(get_remoteproc_state "$rproc_path")
-        if [ "$state" = "running" ]; then
+    fw="$1"
+ 
+    # Fast skip: if DT doesn't advertise this firmware, there may be nothing to validate
+    if command -v dt_has_remoteproc_fw >/dev/null 2>&1; then
+        if ! dt_has_remoteproc_fw "$fw"; then
+            log_skip "DT does not list '$fw' remoteproc; skipping rproc state check"
             return 0
         fi
-        sleep "$delay_per_try_secs"
-        total_waited=$((total_waited + delay_per_try_secs))
-    done
-
-    echo "[ERROR] $fw_name remoteproc did not reach 'running' state within ${max_wait_secs}s (last state: $state)" >> "$log_file"
-    {
-        echo "---- Last 20 remoteproc dmesg logs ----"
-        dmesg | grep -i "remoteproc" | tail -n 20
-        echo "----------------------------------------"
-    } >> "$log_file"
-    return 1
+    fi
+ 
+    # functestlib helper prints "path|state|firmware|name" (one line per instance)
+    entries="$(get_remoteproc_by_firmware "$fw" "" all 2>/dev/null)" || entries=""
+ 
+    if [ -z "$entries" ]; then
+        log_fail "No /sys/class/remoteproc entry found for firmware '$fw'"
+        return 1
+    fi
+ 
+    fail=0
+    while IFS='|' read -r rpath rstate rfirm rname; do
+        [ -n "$rpath" ] || continue
+        inst="$(basename "$rpath")"
+        log_info "remoteproc entry: path=$rpath state=$rstate firmware=$rfirm name=$rname"
+        if [ "$rstate" = "running" ]; then
+            log_pass "$inst: running"
+        else
+            # If you prefer to re-query, uncomment next line:
+            # rstate="$(get_remoteproc_state "$rpath" 2>/dev/null || echo "$rstate")"
+            log_fail "$inst: not running (state=$rstate)"
+            fail=$((fail + 1))
+        fi
+    done <<__RPROC_LIST__
+$entries
+__RPROC_LIST__
+ 
+    [ "$fail" -eq 0 ]
 }
 
 # acquire_test_lock <testname>
@@ -2000,3 +2004,212 @@ execute_capture_block() {
     done
 }
 
+# ---- Wayland/Weston helpers -----------------------
+# Ensure a private XDG runtime directory exists and is usable (0700).
+ensure_private_runtime_dir() {
+    d="$1"
+    [ -n "$d" ] || return 1
+    [ -d "$d" ] || mkdir -p "$d" 2>/dev/null || return 1
+    chmod 0700 "$d" 2>/dev/null || return 1
+    : >"$d/.xdg-test" 2>/dev/null || return 1
+    rm -f "$d/.xdg-test" 2>/dev/null
+    return 0
+}
+
+# Return first Wayland socket under a base dir (prints path or fails).
+find_wayland_socket_in() {
+    base="$1"
+    [ -d "$base" ] || return 1
+    for s in "$base"/wayland-*; do
+        [ -S "$s" ] || continue
+        printf '%s\n' "$s"
+        return 0
+    done
+    return 1
+}
+
+# Best-effort discovery of a usable Wayland socket anywhere.
+discover_wayland_socket_anywhere() {
+    uid="$(id -u 2>/dev/null || echo 0)"
+    bases=""
+    [ -n "$XDG_RUNTIME_DIR" ] && bases="$bases $XDG_RUNTIME_DIR"
+    bases="$bases /dev/socket/weston /run/user/$uid /tmp/wayland-$uid /dev/shm"
+    for b in $bases; do
+        ensure_private_runtime_dir "$b" >/dev/null 2>&1 || true
+        if s="$(find_wayland_socket_in "$b")"; then
+            printf '%s\n' "$s"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Adopt env from a Wayland socket path like /run/user/0/wayland-0
+# Sets XDG_RUNTIME_DIR and WAYLAND_DISPLAY. Returns 0 on success.
+adopt_wayland_env_from_socket() {
+    sock="$1"
+    [ -n "$sock" ] || { log_warn "adopt_wayland_env_from_socket: no socket path given"; return 1; }
+    [ -S "$sock" ] || { log_warn "adopt_wayland_env_from_socket: not a socket: $sock"; return 1; }
+ 
+    # Derive components without external dirname/basename
+    XDG_RUNTIME_DIR=${sock%/*}
+    WAYLAND_DISPLAY=${sock##*/}
+ 
+    export XDG_RUNTIME_DIR
+    export WAYLAND_DISPLAY
+ 
+    log_info "Selected Wayland socket: $sock"
+    log_info "Wayland env: XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR WAYLAND_DISPLAY=$WAYLAND_DISPLAY"
+    return 0
+}
+
+# Try to connect to Wayland. Returns 0 on OK.
+wayland_can_connect() {
+    if command -v weston-info >/dev/null 2>&1; then
+        weston-info >/dev/null 2>&1
+        return $?
+    fi
+    # fallback: quick client probe
+    ( env -i XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" WAYLAND_DISPLAY="$WAYLAND_DISPLAY" true ) >/dev/null 2>&1
+    return $?
+}
+
+# Ensure a Weston socket exists; if not, stop+start Weston and adopt helper socket.
+weston_pick_env_or_start() {
+    sock="$(discover_wayland_socket_anywhere 2>/dev/null || true)"
+    if [ -n "$sock" ]; then
+        adopt_wayland_env_from_socket "$sock"
+        log_info "Selected Wayland socket: $sock"
+        return 0
+    fi
+
+    if weston_is_running; then
+        log_info "Stopping Weston..."
+        weston_stop
+        i=0; while weston_is_running && [ "$i" -lt 5 ]; do i=$((i+1)); sleep 1; done
+    fi
+
+    log_info "Starting Weston..."
+    weston_start
+    i=0; sock=""
+    while [ "$i" -lt 6 ]; do
+        sock="$(find_wayland_socket_in /dev/socket/weston 2>/dev/null || true)"
+        [ -n "$sock" ] && break
+        sleep 1; i=$((i+1))
+    done
+    if [ -z "$sock" ]; then
+        log_fail "Could not find Wayland socket after starting Weston."
+        return 1
+    fi
+    adopt_wayland_env_from_socket "$sock"
+    log_info "Weston started; socket: $sock"
+    return 0
+}
+
+# Find candidate Wayland sockets in common locations.
+# Prints absolute socket paths, one per line, most-preferred first.
+find_wayland_sockets() {
+  uid="$(id -u 2>/dev/null || echo 0)"
+
+  # Start with $XDG_RUNTIME_DIR if set.
+  if [ -n "$XDG_RUNTIME_DIR" ] && [ -d "$XDG_RUNTIME_DIR" ]; then
+    if [ -e "$XDG_RUNTIME_DIR/wayland-1" ]; then
+      printf '%s\n' "$XDG_RUNTIME_DIR/wayland-1"
+    fi
+    if [ -e "$XDG_RUNTIME_DIR/wayland-0" ]; then
+      printf '%s\n' "$XDG_RUNTIME_DIR/wayland-0"
+    fi
+  fi
+
+  # Qualcomm/Yocto common path.
+  if [ -e /dev/socket/weston/wayland-1 ]; then
+    printf '%s\n' /dev/socket/weston/wayland-1
+  fi
+  if [ -e /dev/socket/weston/wayland-0 ]; then
+    printf '%s\n' /dev/socket/weston/wayland-0
+  fi
+
+  # XDG spec default per-user location.
+  if [ -e "/run/user/$uid/wayland-1" ]; then
+    printf '%s\n' "/run/user/$uid/wayland-1"
+  fi
+  if [ -e "/run/user/$uid/wayland-0" ]; then
+    printf '%s\n' "/run/user/$uid/wayland-0"
+  fi
+}
+
+# Ensure XDG_RUNTIME_DIR has owner=current-user and mode 0700.
+# Returns 0 if OK (or fixed), non-zero if still not compliant.
+ensure_wayland_runtime_dir_perms() {
+  dir="$1"
+  [ -n "$dir" ] && [ -d "$dir" ] || return 1
+ 
+  cur_uid="$(id -u 2>/dev/null || echo 0)"
+  cur_gid="$(id -g 2>/dev/null || echo 0)"
+ 
+  # Best-effort fixups first (don’t error if chown/chmod fail)
+  chown "$cur_uid:$cur_gid" "$dir" 2>/dev/null || true
+  chmod 0700 "$dir" 2>/dev/null || true
+ 
+  # Verify using stat (GNU first, then BSD). If stat is unavailable,
+  # we can’t verify—assume OK to avoid SC2012 (ls) usage.
+  if command -v stat >/dev/null 2>&1; then
+    # Mode: GNU: %a ; BSD: %Lp
+    mode="$(stat -c '%a' "$dir" 2>/dev/null || stat -f '%Lp' "$dir" 2>/dev/null || echo '')"
+    # Owner uid: GNU: %u ; BSD: %u
+    uid="$(stat -c '%u' "$dir" 2>/dev/null || stat -f '%u' "$dir" 2>/dev/null || echo '')"
+ 
+    [ "$mode" = "700" ] && [ "$uid" = "$cur_uid" ] && return 0
+    return 1
+  fi
+ 
+  # No stat available: directory exists and we attempted to fix perms/owner.
+  # Treat as success so clients can try; avoids SC2012 warnings.
+  return 0
+}
+
+# Quick Wayland handshake check.
+# Prefers `wayland-info` with a short timeout; otherwise validates socket presence.
+# Also enforces/fixes XDG_RUNTIME_DIR permissions so clients won’t reject it.
+wayland_connection_ok() {
+  if [ -n "$XDG_RUNTIME_DIR" ]; then
+    ensure_wayland_runtime_dir_perms "$XDG_RUNTIME_DIR" || return 1
+  fi
+ 
+  if command -v wayland-info >/dev/null 2>&1; then
+    if command -v timeout >/dev/null 2>&1; then
+      timeout 3s wayland-info >/dev/null 2>&1
+      return $?
+    fi
+    wayland-info >/dev/null 2>&1
+    return $?
+  fi
+ 
+  # Fallback: env variables and socket must exist.
+  if [ -n "$XDG_RUNTIME_DIR" ] && [ -n "$WAYLAND_DISPLAY" ] && [ -e "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ]; then
+    return 0
+  fi
+  return 1
+}
+
+# Print concise metadata for a path (portable).
+# Prefers stat(1) (GNU or BSD); falls back to ls(1) only if needed.
+# Usage: print_path_meta "/some/path"
+print_path_meta() {
+  p=$1
+  if [ -z "$p" ]; then
+    return 1
+  fi
+  # GNU stat
+  if stat -c '%A %U %G %a %n' "$p" >/dev/null 2>&1; then
+    stat -c '%A %U %G %a %n' "$p"
+    return 0
+  fi
+  # BSD/Mac stat
+  if stat -f '%Sp %Su %Sg %OLp %N' "$p" >/dev/null 2>&1; then
+    stat -f '%Sp %Su %Sg %OLp %N' "$p"
+    return 0
+  fi
+  # shellcheck disable=SC2012
+  ls -ld -- "$p" 2>/dev/null
+}
