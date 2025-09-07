@@ -38,13 +38,15 @@ RESULTS_SKIP=""
 
 execute_test_case() {
     test_path=$1
+    shift
+
     test_name=$(basename "$test_path")
 
     if [ -d "$test_path" ]; then
         run_script="$test_path/run.sh"
         if [ -f "$run_script" ]; then
             log "Executing test case: $test_name"
-            (cd "$test_path" && sh "./run.sh")
+            (cd "$test_path" && sh "./run.sh" "$@")
             res_file="$test_path/$test_name.res"
             if [ -f "$res_file" ]; then
                 if grep -q "SKIP" "$res_file"; then
@@ -88,12 +90,13 @@ execute_test_case() {
 
 run_specific_test_by_name() {
     test_name=$1
+    shift
     test_path=$(find_test_case_by_name "$test_name")
     if [ -z "$test_path" ]; then
         log_error "Test case with name $test_name not found."
         RESULTS_FAIL=$(printf "%s\n%s" "$RESULTS_FAIL" "$test_name (not found)")
     else
-        execute_test_case "$test_path"
+        execute_test_case "$test_path" "$@"
     fi
 }
 
@@ -119,15 +122,35 @@ print_summary() {
     log_info "=================================="
 }
 
-if [ "$#" -eq 0 ]; then
-    log "Usage: $0 [all | <testcase_name>]"
-    exit 1
+print_usage() {
+    cat >&2 <<EOF
+Usage:
+  "${0##*/}" all
+  "${0##*/}" <testcase_name> [arg1 arg2 ...]
+
+Notes:
+  - Extra args are forwarded only when a single <testcase_name> is specified.
+  - 'all' runs every test and does not accept additional args.
+  - Use -h or --help to display this message.
+EOF
+}
+
+if [ "$#" -eq 0 ] || [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
+    print_usage
+    if [ "$#" -eq 0 ]; then
+        log_error "No arguments provided"
+        exit 1
+    else
+        exit 0
+    fi
 fi
 
 if [ "$1" = "all" ]; then
     run_all_tests
 else
-    run_specific_test_by_name "$1"
+    test_case_name="$1"
+    shift
+    run_specific_test_by_name "$test_case_name" "$@"
 fi
 
 print_summary
