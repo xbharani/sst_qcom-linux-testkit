@@ -1935,24 +1935,40 @@ $val" ;;
 # Applies media configuration (format and links) using media-ctl from parsed pipeline block.
 # Resets media graph first and applies user-specified format override if needed.
 configure_pipeline_block() {
-    MEDIA_NODE="$1" USER_FORMAT="$2"
-
-    media-ctl -d "$MEDIA_NODE" --reset >/dev/null 2>&1
-
-    # Apply MEDIA_CTL_V (override format if USER_FORMAT set)
-    printf "%s\n" "$MEDIA_CTL_V_LIST" | while IFS= read -r vline || [ -n "$vline" ]; do
-        [ -z "$vline" ] && continue
-        vline_new="$vline"
-        if [ -n "$USER_FORMAT" ]; then
-            vline_new=$(printf "%s" "$vline_new" | sed -E "s/fmt:[^/]+\/([0-9]+x[0-9]+)/fmt:${USER_FORMAT}\/\1/g")
+    MEDIA_NODE="$1"
+ 
+    # Keep arg2 for API compatibility: pads use MBUS formats here; the
+    # requested video pixfmt is applied later by execute_capture_block().
+    # Mark as intentionally read to silence ShellCheck SC2034.
+    # shellcheck disable=SC2034
+    USER_FORMAT="${2:-}"
+    : "${USER_FORMAT:-}"  # intentional no-op read
+ 
+    # Clean slate, like your manual 'reset'
+    log_info "[CMD] media-ctl -d \"$MEDIA_NODE\" --reset"
+    media-ctl -d "$MEDIA_NODE" --reset
+ 
+    # 1) Apply pad formats exactly as parsed. If a line fails with _1X10,
+    #    retry once with the short token (SRGGB10) — some trees prefer it.
+    printf '%s\n' "$MEDIA_CTL_V_LIST" | while IFS= read -r vline; do
+        [ -n "$vline" ] || continue
+        log_info "[CMD] media-ctl -d \"$MEDIA_NODE\" -V \"$vline\""
+        if ! media-ctl -d "$MEDIA_NODE" -V "$vline"; then
+            # fallback: *_1X10 → SRGGB10 for Bayer 10; extend if needed later
+            vline_fallback="$(printf '%s' "$vline" | sed -E 's/fmt:SRGGB10_1X10\//fmt:SRGGB10\//g')"
+            if [ "$vline_fallback" != "$vline" ]; then
+                log_warn "  -V failed, retrying with: $vline_fallback"
+                log_info "[CMD] media-ctl -d \"$MEDIA_NODE\" -V \"$vline_fallback\""
+                media-ctl -d "$MEDIA_NODE" -V "$vline_fallback" || true
+            fi
         fi
-        media-ctl -d "$MEDIA_NODE" -V "$vline_new" >/dev/null 2>&1
     done
-
-    # Apply MEDIA_CTL_L
-    printf "%s\n" "$MEDIA_CTL_L_LIST" | while IFS= read -r lline || [ -n "$lline" ]; do
-        [ -z "$lline" ] && continue
-        media-ctl -d "$MEDIA_NODE" -l "$lline" >/dev/null 2>&1
+ 
+    # 2) Apply links exactly as parsed (same order as your manual sequence).
+    printf '%s\n' "$MEDIA_CTL_L_LIST" | while IFS= read -r lline; do
+        [ -n "$lline" ] || continue
+        log_info "[CMD] media-ctl -d \"$MEDIA_NODE\" -l \"$lline\""
+        media-ctl -d "$MEDIA_NODE" -l "$lline"
     done
 }
 
