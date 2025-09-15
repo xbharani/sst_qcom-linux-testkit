@@ -261,13 +261,21 @@ detect_runner_root() {
 # Function is to check for network connectivity status
 check_network_status() {
     echo "[INFO] Checking network connectivity..."
-
-    # Get first active IPv4 address (excluding loopback)
-    ip_addr=$(ip -4 addr show scope global up | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n 1)
-
+ 
+    # Prefer the egress/source IP chosen by the routing table (most accurate).
+    ip_addr=$(ip -4 route get 1.1.1.1 2>/dev/null \
+              | awk 'NR==1{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
+ 
+    # Fallback: first global IPv4 on any UP interface (works even without a default route).
+    if [ -z "$ip_addr" ]; then
+        ip_addr=$(ip -o -4 addr show scope global up 2>/dev/null \
+                  | awk 'NR==1{split($4,a,"/"); print a[1]}')
+    fi
+ 
     if [ -n "$ip_addr" ]; then
         echo "[PASS] Network is active. IP address: $ip_addr"
-
+ 
+        # Quick reachability probe (single ICMP). BusyBox-compatible flags.
         if ping -c 1 -W 2 8.8.8.8 >/dev/null 2>&1; then
             echo "[PASS] Internet is reachable."
             return 0
@@ -1962,6 +1970,7 @@ configure_pipeline_block() {
                 media-ctl -d "$MEDIA_NODE" -V "$vline_fallback" || true
             fi
         fi
+																  
     done
  
     # 2) Apply links exactly as parsed (same order as your manual sequence).
@@ -2228,4 +2237,54 @@ print_path_meta() {
   fi
   # shellcheck disable=SC2012
   ls -ld -- "$p" 2>/dev/null
+}
+
+soc_id() {
+    if [ -r /sys/devices/soc0/soc_id ]; then
+        cat /sys/devices/soc0/soc_id 2>/dev/null
+    elif [ -r /proc/device-tree/compatible ]; then
+        tr -d '\0' </proc/device-tree/compatible 2>/dev/null | head -n 1
+    else
+        uname -r
+    fi
+}
+
+# --- BusyBox-safe helper: convert "15s" -> 15, pass-through if already integer ---
+timeout_to_seconds() {
+    case "$1" in *s) echo "${1%s}";; *) echo "$1";; esac
+}
+
+# --- POSIX timeout without GNU coreutils ---
+sh_timeout() {
+    dur="$1"; shift
+    [ "$1" = "--" ] && shift
+    case "$dur" in *s) sec=${dur%s} ;; *) sec=$dur ;; esac
+    [ -z "$sec" ] && sec=0
+
+    "$@" &
+    pid=$!
+
+    t=0
+    while kill -0 "$pid" 2>/dev/null; do
+        if [ "$t" -ge "$sec" ] 2>/dev/null; then
+            kill "$pid" 2>/dev/null || true
+            sleep 1
+            kill -9 "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null
+            return 124
+        fi
+        sleep 1
+        t=$((t+1))
+    done
+    wait "$pid"; return $?
+}
+
+# Map test duration keywords to seconds
+duration_to_secs() {
+  case "$1" in
+    short)  echo 5  ;;
+    medium) echo 15 ;;
+    long)   echo 30 ;;
+    *)      echo 5  ;;
+  esac
 }
