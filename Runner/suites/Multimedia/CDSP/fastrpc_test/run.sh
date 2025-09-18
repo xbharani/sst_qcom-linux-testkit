@@ -48,7 +48,7 @@ Usage: $0 [OPTIONS]
 
 Options:
   --arch <name> Architecture (only if explicitly provided)
-  --bin-dir <path> Directory containing 'fastrpc_test' (default: /usr/bin)
+  --bin-dir <path> Directory containing 'fastrpc_test' (default: /usr/local/bin)
   --assets-dir <path> Directory that CONTAINS 'linux/' (info only)
   --domain <0|1|2|3> DSP domain: 0=ADSP, 1=MDSP, 2=SDSP, 3=CDSP
   --domain-name <name> DSP domain by name: adsp|mdsp|sdsp|cdsp
@@ -67,7 +67,7 @@ Env:
 
 Notes:
 - Script *cd*s into the binary's directory and launches ./fastrpc_test so
-  'linux/' next to the binary (e.g. /usr/bin/linux) is discovered reliably.
+  'linux/' next to the binary (e.g. /usr/local/bin/linux) is discovered reliably.
 - If domain not provided, we auto-pick: CDSP if present; else ADSP; else SDSP; else 3.
 EOF
 }
@@ -192,13 +192,13 @@ log_soc_info
 if [ -n "$BIN_DIR" ]; then
     :
 else
-    BIN_DIR="/usr/bin"
+    BIN_DIR="/usr/local/bin"
 fi
 
 case "$BIN_DIR" in
     /bin)
         if [ "${ALLOW_BIN_FASTRPC:-0}" -ne 1 ]; then
-            log_fail "Refusing /bin by default (set ALLOW_BIN_FASTRPC=1 or use --bin-dir /usr/bin)"
+            log_fail "Refusing /bin by default (set ALLOW_BIN_FASTRPC=1 or use --bin-dir /usr/local/bin)"
             echo "$TESTNAME : FAIL" >"$RESULT_FILE"
             exit 1
         fi
@@ -224,6 +224,11 @@ log_info "Run dir: $RUN_DIR (launching ./fastrpc_test)"
 log_info "Binary details:"
 log_info " ls -l: $(ls -l "$RUN_BIN" 2>/dev/null || echo 'N/A')"
 log_info " file : $(file "$RUN_BIN" 2>/dev/null || echo 'N/A')"
+
+# >>>>>>>>>>>>>>>>>>>>>> Added per your request <<<<<<<<<<<<<<<<<<<<<<
+export LD_LIBRARY_PATH="/usr/local/lib/fastrpc_test${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+log_info "LD_LIBRARY_PATH=${LD_LIBRARY_PATH}"
+# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
 # Log *dsp remoteproc statuses via existing helpers
 log_dsp_remoteproc_status
