@@ -289,6 +289,194 @@ check_network_status() {
     fi
 }
 
+
+# ---- Connectivity probe (0 OK, 2 IP/no-internet, 1 no IP) ----
+# Env overrides:
+#   NET_PROBE_ROUTE_IP=1.1.1.1
+#   NET_PING_HOST=8.8.8.8
+check_network_status_rc() {
+    net_probe_route_ip="${NET_PROBE_ROUTE_IP:-1.1.1.1}"
+    net_ping_host="${NET_PING_HOST:-8.8.8.8}"
+ 
+    if command -v ip >/dev/null 2>&1; then
+        net_ip_addr="$(ip -4 route get "$net_probe_route_ip" 2>/dev/null \
+            | awk 'NR==1{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')"
+        if [ -z "$net_ip_addr" ]; then
+            net_ip_addr="$(ip -o -4 addr show scope global up 2>/dev/null \
+                | awk 'NR==1{split($4,a,"/"); print a[1]}')"
+        fi
+    else
+        net_ip_addr=""
+    fi
+ 
+    if [ -n "$net_ip_addr" ]; then
+        if command -v ping >/dev/null 2>&1; then
+            if ping -c 1 -W 2 "$net_ping_host" >/dev/null 2>&1 \
+               || ping -c 1 -w 2 "$net_ping_host" >/dev/null 2>&1; then
+                unset net_probe_route_ip net_ping_host net_ip_addr
+                return 0
+            fi
+            unset net_probe_route_ip net_ping_host net_ip_addr
+            return 2
+        else
+            unset net_probe_route_ip net_ping_host net_ip_addr
+            return 2
+        fi
+    fi
+ 
+    unset net_probe_route_ip net_ping_host net_ip_addr
+    return 1
+}
+
+# ---- Interface snapshot (INFO log only) ----
+net_log_iface_snapshot() {
+    net_ifc="$1"
+    [ -n "$net_ifc" ] || { unset net_ifc; return 0; }
+ 
+    net_admin="DOWN"
+    net_oper="unknown"
+    net_carrier="0"
+    net_ip="none"
+ 
+    if command -v ip >/dev/null 2>&1 && ip -o link show "$net_ifc" >/dev/null 2>&1; then
+        if ip -o link show "$net_ifc" | awk -F'[<>]' '{print $2}' | grep -qw UP; then
+            net_admin="UP"
+        fi
+    fi
+    [ -r "/sys/class/net/$net_ifc/operstate" ] && net_oper="$(cat "/sys/class/net/$net_ifc/operstate" 2>/dev/null)"
+    [ -r "/sys/class/net/$net_ifc/carrier"   ] && net_carrier="$(cat "/sys/class/net/$net_ifc/carrier"   2>/dev/null)"
+ 
+    if command -v get_ip_address >/dev/null 2>&1; then
+        net_ip="$(get_ip_address "$net_ifc" 2>/dev/null)"
+        [ -n "$net_ip" ] || net_ip="none"
+    fi
+ 
+    log_info "[NET] ${net_ifc}: admin=${net_admin} oper=${net_oper} carrier=${net_carrier} ip=${net_ip}"
+ 
+    unset net_ifc net_admin net_oper net_carrier net_ip
+}
+
+# ---- Bring the system online if possible (0 OK, 2 IP/no-internet, 1 no IP) ----
+ensure_network_online() {
+    check_network_status_rc; net_rc=$?
+    [ "$net_rc" -eq 0 ] && { unset net_rc; return 0; }
+ 
+    if command -v systemctl >/dev/null 2>&1 && command -v check_systemd_services >/dev/null 2>&1; then
+        check_systemd_services NetworkManager systemd-networkd connman || true
+    fi
+ 
+    net_had_any_ip=0
+ 
+    # -------- Ethernet pass --------
+    net_ifaces=""
+    if command -v get_ethernet_interfaces >/dev/null 2>&1; then
+        net_ifaces="$(get_ethernet_interfaces 2>/dev/null)"
+    fi
+ 
+    for net_ifc in $net_ifaces; do
+        net_log_iface_snapshot "$net_ifc"
+ 
+        if command -v is_link_up >/dev/null 2>&1; then
+            if ! is_link_up "$net_ifc"; then
+                log_info "[NET] ${net_ifc}: link=down → skipping DHCP"
+                continue
+            fi
+        fi
+ 
+        log_info "[NET] ${net_ifc}: bringing up and requesting DHCP..."
+        if command -v bringup_interface >/dev/null 2>&1; then
+            bringup_interface "$net_ifc" 2 2 || true
+        fi
+ 
+        if command -v run_dhcp_client >/dev/null 2>&1; then
+            run_dhcp_client "$net_ifc" 10 >/dev/null 2>&1 || true
+        elif command -v try_dhcp_client_safe >/dev/null 2>&1; then
+            try_dhcp_client_safe "$net_ifc" 8 || true
+        fi
+ 
+        net_log_iface_snapshot "$net_ifc"
+ 
+        check_network_status_rc; net_rc=$?
+        case "$net_rc" in
+            0) log_pass "[NET] ${net_ifc}: internet reachable"; unset net_ifaces net_ifc net_rc net_had_any_ip; return 0 ;;
+            2) log_warn "[NET] ${net_ifc}: IP assigned but internet not reachable"; net_had_any_ip=1 ;;
+            1) log_info "[NET] ${net_ifc}: still no IP after DHCP attempt" ;;
+        esac
+    done
+ 
+    # -------- Wi-Fi pass --------
+    net_wifi=""
+    if command -v get_wifi_interface >/dev/null 2>&1; then
+        net_wifi="$(get_wifi_interface 2>/dev/null || echo "")"
+    fi
+    if [ -n "$net_wifi" ]; then
+        net_log_iface_snapshot "$net_wifi"
+        log_info "[NET] ${net_wifi}: bringing up Wi-Fi..."
+ 
+        if command -v bringup_interface >/dev/null 2>&1; then
+            bringup_interface "$net_wifi" 2 2 || true
+        fi
+ 
+        net_creds=""
+        if command -v get_wifi_credentials >/dev/null 2>&1; then
+            net_creds="$(get_wifi_credentials "" "" 2>/dev/null || true)"
+        fi
+ 
+        if [ -n "$net_creds" ]; then
+            net_ssid="$(printf '%s\n' "$net_creds" | awk '{print $1}')"
+            net_pass="$(printf '%s\n' "$net_creds" | awk '{print $2}')"
+            log_info "[NET] ${net_wifi}: trying nmcli/wpa_supplicant for SSID='${net_ssid}'"
+            if command -v wifi_connect_nmcli >/dev/null 2>&1; then
+                wifi_connect_nmcli "$net_wifi" "$net_ssid" "$net_pass" || true
+            fi
+            if command -v wifi_connect_wpa_supplicant >/dev/null 2>&1; then
+                wifi_connect_wpa_supplicant "$net_wifi" "$net_ssid" "$net_pass" || true
+            fi
+        else
+            log_info "[NET] ${net_wifi}: no credentials provided → DHCP only"
+            if command -v run_dhcp_client >/dev/null 2>&1; then
+                run_dhcp_client "$net_wifi" 10 >/dev/null 2>&1 || true
+            fi
+        fi
+ 
+        net_log_iface_snapshot "$net_wifi"
+        check_network_status_rc; net_rc=$?
+        case "$net_rc" in
+            0) log_pass "[NET] ${net_wifi}: internet reachable"; unset net_wifi net_ifaces net_ifc net_rc net_had_any_ip net_creds net_ssid net_pass; return 0 ;;
+            2) log_warn "[NET] ${net_wifi}: IP assigned but internet not reachable"; net_had_any_ip=1 ;;
+            1) log_info "[NET] ${net_wifi}: still no IP after connect/DHCP attempt" ;;
+        esac
+    fi
+ 
+    # -------- DHCP/route/DNS fixup (udhcpc script) --------
+    net_script_path=""
+    if command -v ensure_udhcpc_script >/dev/null 2>&1; then
+        net_script_path="$(ensure_udhcpc_script 2>/dev/null || echo "")"
+    fi
+    if [ -n "$net_script_path" ]; then
+        log_info "[NET] udhcpc default.script present → refreshing leases"
+        for net_ifc in $net_ifaces $net_wifi; do
+            [ -n "$net_ifc" ] || continue
+            if command -v run_dhcp_client >/dev/null 2>&1; then
+                run_dhcp_client "$net_ifc" 8 >/dev/null 2>&1 || true
+            fi
+        done
+        check_network_status_rc; net_rc=$?
+        case "$net_rc" in
+            0) log_pass "[NET] connectivity restored after udhcpc fixup"; unset net_script_path net_ifaces net_wifi net_ifc net_rc net_had_any_ip; return 0 ;;
+            2) log_warn "[NET] IP present but still no internet after udhcpc fixup"; net_had_any_ip=1 ;;
+        esac
+    fi
+ 
+    if [ "$net_had_any_ip" -eq 1 ] 2>/dev/null; then
+        unset net_script_path net_ifaces net_wifi net_ifc net_rc net_had_any_ip
+        return 2
+    fi
+    unset net_script_path net_ifaces net_wifi net_ifc net_rc net_had_any_ip
+    return 1
+}
+
+
 # If the tar file already exists,then function exit. Otherwise function to check the network connectivity and it will download tar from internet.
 extract_tar_from_url() {
     url=$1
