@@ -1935,7 +1935,7 @@ wait_for_path() {
         [ -e "$_p" ] && return 0
         sleep 1
         i=$((i+1))
-    done
+   done
     return 1
 }
 
@@ -2475,4 +2475,14 @@ duration_to_secs() {
     long)   echo 30 ;;
     *)      echo 5  ;;
   esac
+}
+
+log_soc_info() {
+    m=""; s=""; pv=""
+    [ -r /sys/devices/soc0/machine ] && m="$(cat /sys/devices/soc0/machine 2>/dev/null)"
+    [ -r /sys/devices/soc0/soc_id ] && s="$(cat /sys/devices/soc0/soc_id 2>/dev/null)"
+    [ -r /sys/devices/soc0/platform_version ] && pv="$(cat /sys/devices/soc0/platform_version 2>/dev/null)"
+    [ -n "$m" ] && log_info "SoC.machine: $m"
+    [ -n "$s" ] && log_info "SoC.soc_id: $s"
+    [ -n "$pv" ] && log_info "SoC.platform_version: $pv"
 }
