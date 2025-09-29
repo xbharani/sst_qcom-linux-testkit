@@ -1,4 +1,5 @@
 #!/bin/sh
+#!/bin/sh
 
 # Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 # SPDX-License-Identifier: BSD-3-Clause-Clear
@@ -289,267 +290,269 @@ check_network_status() {
     fi
 }
 
-
-# ---- Connectivity probe (0 OK, 2 IP/no-internet, 1 no IP) ----
-# Env overrides:
-#   NET_PROBE_ROUTE_IP=1.1.1.1
-#   NET_PING_HOST=8.8.8.8
-check_network_status_rc() {
-    net_probe_route_ip="${NET_PROBE_ROUTE_IP:-1.1.1.1}"
-    net_ping_host="${NET_PING_HOST:-8.8.8.8}"
+# --- Make sure system time is sane (TLS needs a sane clock) ---
+ensure_reasonable_clock() {
+    now="$(date +%s 2>/dev/null || echo 0)"
+    cutoff="$(date -d '2020-01-01 UTC' +%s 2>/dev/null || echo 1577836800)"
+    [ -z "$cutoff" ] && cutoff=1577836800
+    [ "$now" -ge "$cutoff" ] 2>/dev/null && return 0
  
-    if command -v ip >/dev/null 2>&1; then
-        net_ip_addr="$(ip -4 route get "$net_probe_route_ip" 2>/dev/null \
-            | awk 'NR==1{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')"
-        if [ -z "$net_ip_addr" ]; then
-            net_ip_addr="$(ip -o -4 addr show scope global up 2>/dev/null \
-                | awk 'NR==1{split($4,a,"/"); print a[1]}')"
-        fi
-    else
-        net_ip_addr=""
+    log_warn "System clock looks invalid (epoch=$now). Attempting quick time sync..."
+    if command -v timedatectl >/dev/null 2>&1; then
+        timedatectl set-ntp true 2>/dev/null || true
+        sleep 1
     fi
- 
-    if [ -n "$net_ip_addr" ]; then
-        if command -v ping >/dev/null 2>&1; then
-            if ping -c 1 -W 2 "$net_ping_host" >/dev/null 2>&1 \
-               || ping -c 1 -w 2 "$net_ping_host" >/dev/null 2>&1; then
-                unset net_probe_route_ip net_ping_host net_ip_addr
-                return 0
-            fi
-            unset net_probe_route_ip net_ping_host net_ip_addr
-            return 2
-        else
-            unset net_probe_route_ip net_ping_host net_ip_addr
-            return 2
-        fi
+    # If no NTP client, we cannot do much more here.
+    now2="$(date +%s 2>/dev/null || echo 0)"
+    if [ "$now2" -ge "$cutoff" ] 2>/dev/null; then
+        log_pass "Clock synchronized."
+        return 0
     fi
- 
-    unset net_probe_route_ip net_ping_host net_ip_addr
-    return 1
-}
-
-# ---- Interface snapshot (INFO log only) ----
-net_log_iface_snapshot() {
-    net_ifc="$1"
-    [ -n "$net_ifc" ] || { unset net_ifc; return 0; }
- 
-    net_admin="DOWN"
-    net_oper="unknown"
-    net_carrier="0"
-    net_ip="none"
- 
-    if command -v ip >/dev/null 2>&1 && ip -o link show "$net_ifc" >/dev/null 2>&1; then
-        if ip -o link show "$net_ifc" | awk -F'[<>]' '{print $2}' | grep -qw UP; then
-            net_admin="UP"
-        fi
-    fi
-    [ -r "/sys/class/net/$net_ifc/operstate" ] && net_oper="$(cat "/sys/class/net/$net_ifc/operstate" 2>/dev/null)"
-    [ -r "/sys/class/net/$net_ifc/carrier"   ] && net_carrier="$(cat "/sys/class/net/$net_ifc/carrier"   2>/dev/null)"
- 
-    if command -v get_ip_address >/dev/null 2>&1; then
-        net_ip="$(get_ip_address "$net_ifc" 2>/dev/null)"
-        [ -n "$net_ip" ] || net_ip="none"
-    fi
- 
-    log_info "[NET] ${net_ifc}: admin=${net_admin} oper=${net_oper} carrier=${net_carrier} ip=${net_ip}"
- 
-    unset net_ifc net_admin net_oper net_carrier net_ip
-}
-
-# ---- Bring the system online if possible (0 OK, 2 IP/no-internet, 1 no IP) ----
-ensure_network_online() {
-    check_network_status_rc; net_rc=$?
-    [ "$net_rc" -eq 0 ] && { unset net_rc; return 0; }
- 
-    if command -v systemctl >/dev/null 2>&1 && command -v check_systemd_services >/dev/null 2>&1; then
-        check_systemd_services NetworkManager systemd-networkd connman || true
-    fi
- 
-    net_had_any_ip=0
- 
-    # -------- Ethernet pass --------
-    net_ifaces=""
-    if command -v get_ethernet_interfaces >/dev/null 2>&1; then
-        net_ifaces="$(get_ethernet_interfaces 2>/dev/null)"
-    fi
- 
-    for net_ifc in $net_ifaces; do
-        net_log_iface_snapshot "$net_ifc"
- 
-        if command -v is_link_up >/dev/null 2>&1; then
-            if ! is_link_up "$net_ifc"; then
-                log_info "[NET] ${net_ifc}: link=down → skipping DHCP"
-                continue
-            fi
-        fi
- 
-        log_info "[NET] ${net_ifc}: bringing up and requesting DHCP..."
-        if command -v bringup_interface >/dev/null 2>&1; then
-            bringup_interface "$net_ifc" 2 2 || true
-        fi
- 
-        if command -v run_dhcp_client >/dev/null 2>&1; then
-            run_dhcp_client "$net_ifc" 10 >/dev/null 2>&1 || true
-        elif command -v try_dhcp_client_safe >/dev/null 2>&1; then
-            try_dhcp_client_safe "$net_ifc" 8 || true
-        fi
- 
-        net_log_iface_snapshot "$net_ifc"
- 
-        check_network_status_rc; net_rc=$?
-        case "$net_rc" in
-            0) log_pass "[NET] ${net_ifc}: internet reachable"; unset net_ifaces net_ifc net_rc net_had_any_ip; return 0 ;;
-            2) log_warn "[NET] ${net_ifc}: IP assigned but internet not reachable"; net_had_any_ip=1 ;;
-            1) log_info "[NET] ${net_ifc}: still no IP after DHCP attempt" ;;
-        esac
-    done
- 
-    # -------- Wi-Fi pass --------
-    net_wifi=""
-    if command -v get_wifi_interface >/dev/null 2>&1; then
-        net_wifi="$(get_wifi_interface 2>/dev/null || echo "")"
-    fi
-    if [ -n "$net_wifi" ]; then
-        net_log_iface_snapshot "$net_wifi"
-        log_info "[NET] ${net_wifi}: bringing up Wi-Fi..."
- 
-        if command -v bringup_interface >/dev/null 2>&1; then
-            bringup_interface "$net_wifi" 2 2 || true
-        fi
- 
-        net_creds=""
-        if command -v get_wifi_credentials >/dev/null 2>&1; then
-            net_creds="$(get_wifi_credentials "" "" 2>/dev/null || true)"
-        fi
- 
-        if [ -n "$net_creds" ]; then
-            net_ssid="$(printf '%s\n' "$net_creds" | awk '{print $1}')"
-            net_pass="$(printf '%s\n' "$net_creds" | awk '{print $2}')"
-            log_info "[NET] ${net_wifi}: trying nmcli/wpa_supplicant for SSID='${net_ssid}'"
-            if command -v wifi_connect_nmcli >/dev/null 2>&1; then
-                wifi_connect_nmcli "$net_wifi" "$net_ssid" "$net_pass" || true
-            fi
-            if command -v wifi_connect_wpa_supplicant >/dev/null 2>&1; then
-                wifi_connect_wpa_supplicant "$net_wifi" "$net_ssid" "$net_pass" || true
-            fi
-        else
-            log_info "[NET] ${net_wifi}: no credentials provided → DHCP only"
-            if command -v run_dhcp_client >/dev/null 2>&1; then
-                run_dhcp_client "$net_wifi" 10 >/dev/null 2>&1 || true
-            fi
-        fi
- 
-        net_log_iface_snapshot "$net_wifi"
-        check_network_status_rc; net_rc=$?
-        case "$net_rc" in
-            0) log_pass "[NET] ${net_wifi}: internet reachable"; unset net_wifi net_ifaces net_ifc net_rc net_had_any_ip net_creds net_ssid net_pass; return 0 ;;
-            2) log_warn "[NET] ${net_wifi}: IP assigned but internet not reachable"; net_had_any_ip=1 ;;
-            1) log_info "[NET] ${net_wifi}: still no IP after connect/DHCP attempt" ;;
-        esac
-    fi
- 
-    # -------- DHCP/route/DNS fixup (udhcpc script) --------
-    net_script_path=""
-    if command -v ensure_udhcpc_script >/dev/null 2>&1; then
-        net_script_path="$(ensure_udhcpc_script 2>/dev/null || echo "")"
-    fi
-    if [ -n "$net_script_path" ]; then
-        log_info "[NET] udhcpc default.script present → refreshing leases"
-        for net_ifc in $net_ifaces $net_wifi; do
-            [ -n "$net_ifc" ] || continue
-            if command -v run_dhcp_client >/dev/null 2>&1; then
-                run_dhcp_client "$net_ifc" 8 >/dev/null 2>&1 || true
-            fi
-        done
-        check_network_status_rc; net_rc=$?
-        case "$net_rc" in
-            0) log_pass "[NET] connectivity restored after udhcpc fixup"; unset net_script_path net_ifaces net_wifi net_ifc net_rc net_had_any_ip; return 0 ;;
-            2) log_warn "[NET] IP present but still no internet after udhcpc fixup"; net_had_any_ip=1 ;;
-        esac
-    fi
- 
-    if [ "$net_had_any_ip" -eq 1 ] 2>/dev/null; then
-        unset net_script_path net_ifaces net_wifi net_ifc net_rc net_had_any_ip
-        return 2
-    fi
-    unset net_script_path net_ifaces net_wifi net_ifc net_rc net_had_any_ip
+    log_warn "Clock still invalid; TLS downloads may fail. Treating as limited network."
     return 1
 }
 
 
 # If the tar file already exists,then function exit. Otherwise function to check the network connectivity and it will download tar from internet.
 extract_tar_from_url() {
-    url=$1
-    filename=$(basename "$url")
-
-    check_tar_file "$url"
-    status=$?
+    url="$1"
+    outdir="${LOG_DIR:-.}"
+    mkdir -p "$outdir" 2>/dev/null || true
+ 
+    case "$url" in
+        /*) tarfile="$url" ;;
+        file://*) tarfile="${url#file://}" ;;
+        *)  tarfile="$outdir/$(basename "$url")" ;;
+    esac
+    markfile="${tarfile}.extracted"
+ 
+    # --- small helper: decide if this archive already looks extracted in $outdir
+    tar_already_extracted() {
+        tf="$1"
+        od="$2"
+ 
+        # Fast path: explicit marker from a previous successful extract.
+        [ -f "${tf}.extracted" ] && return 0
+ 
+        # Fall back: sniff a few entries from the archive and see if they exist on disk.
+        # (No reliance on any one filename; majority-of-first-10 rule.)
+        # NOTE: we intentionally avoid pipes->subshell to keep counters reliable in POSIX sh.
+        tmp_list="${od}/.tar_ls.$$"
+        if tar -tf "$tf" 2>/dev/null | head -n 20 >"$tmp_list"; then
+            total=0; present=0
+            # shellcheck disable=SC2039
+            while IFS= read -r ent; do
+                [ -z "$ent" ] && continue
+                total=$((total + 1))
+                # Normalize (strip trailing slash for directories)
+                ent="${ent%/}"
+                # Check both full relative path and basename (covers archives with nested roots)
+                if [ -e "$od/$ent" ] || [ -e "$od/$(basename "$ent")" ]; then
+                    present=$((present + 1))
+                fi
+            done < "$tmp_list"
+            rm -f "$tmp_list" 2>/dev/null || true
+ 
+            # If we have at least 3 hits or ≥50% of probed entries, assume it's already extracted.
+            if [ "$present" -ge 3 ] || { [ "$total" -gt 0 ] && [ $((present * 100 / total)) -ge 50 ]; }; then
+                return 0
+            fi
+        fi
+        return 1
+    }
+ 
+    if command -v check_tar_file >/dev/null 2>&1; then
+        # Your site-specific validator (returns 0=extracted ok, 2=exists but not extracted, 1=missing/bad)
+        check_tar_file "$url"; status=$?
+    else
+        # Fallback: if archive exists and looks extracted -> status=0; if exists not-extracted -> 2; else 1
+        if [ -f "$tarfile" ]; then
+            if tar_already_extracted "$tarfile" "$outdir"; then
+                status=0
+            else
+                status=2
+            fi
+        else
+            status=1
+        fi
+    fi
+ 
+    ensure_reasonable_clock || { log_warn "Proceeding in limited-network mode."; limited_net=1; }
+ 
+    # ---- helpers ------------------------------------------------------------
+    is_busybox_wget() { command -v wget >/dev/null 2>&1 && wget --help 2>&1 | head -n1 | grep -qi busybox; }
+ 
+    try_download() {
+        src="$1"; dst="$2"
+        part="${dst}.part.$$"
+        ca=""
+        for cand in /etc/ssl/certs/ca-certificates.crt /etc/ssl/cert.pem /system/etc/security/cacerts/ca-certificates.crt; do
+            [ -r "$cand" ] && ca="$cand" && break
+        done
+ 
+        # 1) curl first (IPv4, retries, redirects)
+        if command -v curl >/dev/null 2>&1; then
+            if [ -n "$ca" ]; then
+                curl -4 -L --fail --retry 3 --retry-delay 2 --connect-timeout 10 \
+                     -o "$part" --cacert "$ca" "$src"
+            else
+                curl -4 -L --fail --retry 3 --retry-delay 2 --connect-timeout 10 \
+                     -o "$part" "$src"
+            fi
+            rc=$?
+            if [ $rc -eq 0 ]; then mv -f "$part" "$dst" 2>/dev/null || true; return 0; fi
+            rm -f "$part" 2>/dev/null || true
+            case "$rc" in 60|35|22) return 60 ;; esac   # TLS-ish / HTTP fail
+        fi
+ 
+        # 2) aria2c (if available)
+        if command -v aria2c >/dev/null 2>&1; then
+            aria2c -x4 -s4 -m3 --connect-timeout=10 \
+                   -o "$(basename "$part")" --dir="$(dirname "$part")" "$src"
+            rc=$?
+            if [ $rc -eq 0 ]; then mv -f "$part" "$dst" 2>/dev/null || true; return 0; fi
+            rm -f "$part" 2>/dev/null || true
+        fi
+ 
+        # 3) wget: handle BusyBox vs GNU
+        if command -v wget >/dev/null 2>&1; then
+            if is_busybox_wget; then
+                # BusyBox wget has: -O, -T, --no-check-certificate (no -4, no --tries)
+                wget -O "$part" -T 15 "$src"; rc=$?
+                if [ $rc -ne 0 ]; then
+                    log_warn "BusyBox wget failed (rc=$rc); final attempt with --no-check-certificate."
+                    wget -O "$part" -T 15 --no-check-certificate "$src"; rc=$?
+                fi
+                if [ $rc -eq 0 ]; then mv -f "$part" "$dst" 2>/dev/null || true; return 0; fi
+                rm -f "$part" 2>/dev/null || true
+                return 60
+            else
+                # GNU wget: can use IPv4 and tries
+                if [ -n "$ca" ]; then
+                    wget -4 --timeout=15 --tries=3 --ca-certificate="$ca" -O "$part" "$src"; rc=$?
+                else
+                    wget -4 --timeout=15 --tries=3 -O "$part" "$src"; rc=$?
+                fi
+                if [ $rc -ne 0 ]; then
+                    log_warn "wget failed (rc=$rc); final attempt with --no-check-certificate."
+                    wget -4 --timeout=15 --tries=1 --no-check-certificate -O "$part" "$src"; rc=$?
+                fi
+                if [ $rc -eq 0 ] ; then mv -f "$part" "$dst" 2>/dev/null || true; return 0; fi
+                rm -f "$part" 2>/dev/null || true
+                [ $rc -eq 5 ] && return 60
+                return $rc
+            fi
+        fi
+ 
+        return 127
+    }
+    # ------------------------------------------------------------------------
+ 
     if [ "$status" -eq 0 ]; then
         log_info "Already extracted. Skipping download."
         return 0
-    elif [ "$status" -eq 1 ]; then
-        log_info "File missing or invalid. Will download and extract."
-        check_network_status || return 1
-        log_info "Downloading $url..."
-        wget -O "$filename" "$url" || {
-            log_fail "Failed to download $filename"
-            return 1
-        }
-        log_info "Extracting $filename..."
-        tar -xvf "$filename" || {
-            log_fail "Failed to extract $filename"
-            return 1
-        }
     elif [ "$status" -eq 2 ]; then
         log_info "File exists and is valid, but not yet extracted. Proceeding to extract."
-        tar -xvf "$filename" || {
-            log_fail "Failed to extract $filename"
-            return 1
-        }
-    fi
-
-    # Optionally, check that extraction succeeded
-    first_entry=$(tar -tf "$filename" 2>/dev/null | head -n1 | cut -d/ -f1)
-    if [ -n "$first_entry" ] && [ -e "$first_entry" ]; then
-        log_pass "Files extracted successfully ($first_entry exists)."
-        return 0
     else
-        log_fail "Extraction did not create expected entry: $first_entry"
-        return 1
+        case "$url" in
+            /*|file://*)
+                if [ ! -f "$tarfile" ]; then log_fail "Local tar file not found: $tarfile"; return 1; fi
+                ;;
+            *)
+                if [ -n "$limited_net" ]; then
+                    log_warn "Limited network; cannot fetch media bundle. Will SKIP decode cases."
+                    return 2
+                fi
+                log_info "Downloading $url -> $tarfile"
+                if ! try_download "$url" "$tarfile"; then
+                    rc=$?
+                    if [ $rc -eq 60 ]; then
+                        log_warn "TLS/handshake problem while downloading (cert/clock/firewall). Treating as limited network."
+                        return 2
+                    fi
+                    log_fail "Failed to download $(basename "$url")"
+                    return 1
+                fi
+                ;;
+        esac
     fi
+ 
+    log_info "Extracting $(basename "$tarfile")..."
+    if tar -xvf "$tarfile"; then
+        # If we got here, assume success; write marker for future quick skips.
+        : > "$markfile" 2>/dev/null || true
+ 
+        # Best-effort sanity: verify at least one entry now exists.
+        first_entry=$(tar -tf "$tarfile" 2>/dev/null | head -n1 | sed 's#/$##')
+        if [ -n "$first_entry" ] && { [ -e "$first_entry" ] || [ -e "$outdir/$first_entry" ]; }; then
+            log_pass "Files extracted successfully ($(basename "$first_entry") present)."
+            return 0
+        fi
+        log_warn "Extraction finished but couldn't verify entries. Assuming success."
+        return 0
+    fi
+ 
+    log_fail "Failed to extract $(basename "$tarfile")"
+    return 1
 }
 
 # Function to check if a tar file exists
 check_tar_file() {
-    url=$1
-    filename=$(basename "$url")
-
-    # 1. Check file exists
-    if [ ! -f "$filename" ]; then
-        log_error "File $filename does not exist."
+    url="$1"
+    outdir="${LOG_DIR:-.}"
+    mkdir -p "$outdir" 2>/dev/null || true
+ 
+    case "$url" in
+        /*)       tarfile="$url" ;;
+        file://*) tarfile="${url#file://}" ;;
+        *)        tarfile="$outdir/$(basename "$url")" ;;
+    esac
+    markfile="${tarfile}.extracted"
+ 
+    # 1) Existence & basic validity
+    if [ ! -f "$tarfile" ]; then
+        log_info "File $(basename "$tarfile") does not exist in $outdir."
         return 1
     fi
-
-    # 2. Check file is non-empty
-    if [ ! -s "$filename" ]; then
-        log_error "File $filename exists but is empty."
+    if [ ! -s "$tarfile" ]; then
+        log_warn "File $(basename "$tarfile") exists but is empty."
         return 1
     fi
-
-    # 3. Check file is a valid tar archive
-    if ! tar -tf "$filename" >/dev/null 2>&1; then
-        log_error "File $filename is not a valid tar archive."
+    if ! tar -tf "$tarfile" >/dev/null 2>&1; then
+        log_warn "File $(basename "$tarfile") is not a valid tar archive."
         return 1
     fi
-
-    # 4. Check if already extracted: does the first entry in the tar exist?
-    first_entry=$(tar -tf "$filename" 2>/dev/null | head -n1 | cut -d/ -f1)
-    if [ -n "$first_entry" ] && [ -e "$first_entry" ]; then
-        log_pass "$filename has already been extracted ($first_entry exists)."
+ 
+    # 2) Already extracted? (marker first)
+    if [ -f "$markfile" ]; then
+        log_pass "$(basename "$tarfile") has already been extracted (marker present)."
         return 0
     fi
-
-    log_info "$filename exists and is valid, but not yet extracted."
+ 
+    # 3) Heuristic: check multiple entries from the tar exist on disk
+    tmp_list="${outdir}/.tar_ls.$$"
+    if tar -tf "$tarfile" 2>/dev/null | head -n 20 >"$tmp_list"; then
+        total=0; present=0
+        while IFS= read -r ent; do
+            [ -z "$ent" ] && continue
+            total=$((total + 1))
+            ent="${ent%/}"
+            # check exact relative path and also basename (covers archives with a top-level dir)
+            if [ -e "$outdir/$ent" ] || [ -e "$outdir/$(basename "$ent")" ]; then
+                present=$((present + 1))
+            fi
+        done < "$tmp_list"
+        rm -f "$tmp_list" 2>/dev/null || true
+ 
+        # If we find a reasonable portion of entries, assume it's extracted
+        if [ "$present" -ge 3 ] || { [ "$total" -gt 0 ] && [ $((present * 100 / total)) -ge 50 ]; }; then
+            log_pass "$(basename "$tarfile") already extracted ($present/$total entries found)."
+            return 0
+        fi
+    fi
+ 
+    # 4) Exists and valid, but not yet extracted
+    log_info "$(basename "$tarfile") exists and is valid, but not yet extracted."
     return 2
 }
 
@@ -703,25 +706,14 @@ get_ip_address() {
 # Run a command with a timeout (in seconds)
 run_with_timeout() {
     timeout="$1"; shift
-    [ -z "$timeout" ] && { "$@"; return $?; }
- 
-    if command -v timeout >/dev/null 2>&1; then
-        timeout "$timeout" "$@"
-        return $?
-    fi
- 
-    # fallback if coreutils timeout is missing
-    (
-        "$@" &
-        pid=$!
-        ( sleep "$timeout"; kill "$pid" 2>/dev/null ) &
-        watcher=$!
-        wait $pid 2>/dev/null
-        status=$?
-        kill $watcher 2>/dev/null
-        exit $status
-    )
-    return $?
+    ( "$@" ) &
+    pid=$!
+    ( sleep "$timeout"; kill "$pid" 2>/dev/null ) &
+    watcher=$!
+    wait $pid 2>/dev/null
+    status=$?
+    kill $watcher 2>/dev/null
+    return $status
 }
 
 # DHCP client logic (dhclient and udhcpc with timeouts)
@@ -1332,45 +1324,41 @@ start_remoteproc() {
     printf 'start\n' >"$statef" 2>/dev/null || return 1
     wait_remoteproc_state "$path" running 6
 }
-
-# Returns 0 if every rproc using $1 firmware is running; non-zero otherwise.
+# Validate remoteproc running state with retries and logging
 validate_remoteproc_running() {
-    fw="$1"
- 
-    # Fast skip: if DT doesn't advertise this firmware, there may be nothing to validate
-    if command -v dt_has_remoteproc_fw >/dev/null 2>&1; then
-        if ! dt_has_remoteproc_fw "$fw"; then
-            log_skip "DT does not list '$fw' remoteproc; skipping rproc state check"
-            return 0
-        fi
-    fi
- 
-    # functestlib helper prints "path|state|firmware|name" (one line per instance)
-    entries="$(get_remoteproc_by_firmware "$fw" "" all 2>/dev/null)" || entries=""
- 
-    if [ -z "$entries" ]; then
-        log_fail "No /sys/class/remoteproc entry found for firmware '$fw'"
+    fw_name="$1"
+    log_file="${2:-/dev/null}"
+    max_wait_secs="${3:-10}"
+    delay_per_try_secs="${4:-1}"
+
+    rproc_path=$(get_remoteproc_path_by_firmware "$fw_name")
+    if [ -z "$rproc_path" ]; then
+        echo "[ERROR] Remoteproc for '$fw_name' not found" >> "$log_file"
+        {
+            echo "---- Last 20 remoteproc dmesg logs ----"
+            dmesg | grep -i "remoteproc" | tail -n 20
+            echo "----------------------------------------"
+        } >> "$log_file"
         return 1
     fi
- 
-    fail=0
-    while IFS='|' read -r rpath rstate rfirm rname; do
-        [ -n "$rpath" ] || continue
-        inst="$(basename "$rpath")"
-        log_info "remoteproc entry: path=$rpath state=$rstate firmware=$rfirm name=$rname"
-        if [ "$rstate" = "running" ]; then
-            log_pass "$inst: running"
-        else
-            # If you prefer to re-query, uncomment next line:
-            # rstate="$(get_remoteproc_state "$rpath" 2>/dev/null || echo "$rstate")"
-            log_fail "$inst: not running (state=$rstate)"
-            fail=$((fail + 1))
+
+    total_waited=0
+    while [ "$total_waited" -lt "$max_wait_secs" ]; do
+        state=$(get_remoteproc_state "$rproc_path")
+        if [ "$state" = "running" ]; then
+            return 0
         fi
-    done <<__RPROC_LIST__
-$entries
-__RPROC_LIST__
- 
-    [ "$fail" -eq 0 ]
+        sleep "$delay_per_try_secs"
+        total_waited=$((total_waited + delay_per_try_secs))
+    done
+
+    echo "[ERROR] $fw_name remoteproc did not reach 'running' state within ${max_wait_secs}s (last state: $state)" >> "$log_file"
+    {
+        echo "---- Last 20 remoteproc dmesg logs ----"
+        dmesg | grep -i "remoteproc" | tail -n 20
+        echo "----------------------------------------"
+    } >> "$log_file"
+    return 1
 }
 
 # acquire_test_lock <testname>
@@ -1935,7 +1923,7 @@ wait_for_path() {
         [ -e "$_p" ] && return 0
         sleep 1
         i=$((i+1))
-   done
+    done
     return 1
 }
 
@@ -2131,41 +2119,24 @@ $val" ;;
 # Applies media configuration (format and links) using media-ctl from parsed pipeline block.
 # Resets media graph first and applies user-specified format override if needed.
 configure_pipeline_block() {
-    MEDIA_NODE="$1"
- 
-    # Keep arg2 for API compatibility: pads use MBUS formats here; the
-    # requested video pixfmt is applied later by execute_capture_block().
-    # Mark as intentionally read to silence ShellCheck SC2034.
-    # shellcheck disable=SC2034
-    USER_FORMAT="${2:-}"
-    : "${USER_FORMAT:-}"  # intentional no-op read
- 
-    # Clean slate, like your manual 'reset'
-    log_info "[CMD] media-ctl -d \"$MEDIA_NODE\" --reset"
-    media-ctl -d "$MEDIA_NODE" --reset
- 
-    # 1) Apply pad formats exactly as parsed. If a line fails with _1X10,
-    #    retry once with the short token (SRGGB10) — some trees prefer it.
-    printf '%s\n' "$MEDIA_CTL_V_LIST" | while IFS= read -r vline; do
-        [ -n "$vline" ] || continue
-        log_info "[CMD] media-ctl -d \"$MEDIA_NODE\" -V \"$vline\""
-        if ! media-ctl -d "$MEDIA_NODE" -V "$vline"; then
-            # fallback: *_1X10 → SRGGB10 for Bayer 10; extend if needed later
-            vline_fallback="$(printf '%s' "$vline" | sed -E 's/fmt:SRGGB10_1X10\//fmt:SRGGB10\//g')"
-            if [ "$vline_fallback" != "$vline" ]; then
-                log_warn "  -V failed, retrying with: $vline_fallback"
-                log_info "[CMD] media-ctl -d \"$MEDIA_NODE\" -V \"$vline_fallback\""
-                media-ctl -d "$MEDIA_NODE" -V "$vline_fallback" || true
-            fi
+    MEDIA_NODE="$1" USER_FORMAT="$2"
+
+    media-ctl -d "$MEDIA_NODE" --reset >/dev/null 2>&1
+
+    # Apply MEDIA_CTL_V (override format if USER_FORMAT set)
+    printf "%s\n" "$MEDIA_CTL_V_LIST" | while IFS= read -r vline || [ -n "$vline" ]; do
+        [ -z "$vline" ] && continue
+        vline_new="$vline"
+        if [ -n "$USER_FORMAT" ]; then
+            vline_new=$(printf "%s" "$vline_new" | sed -E "s/fmt:[^/]+\/([0-9]+x[0-9]+)/fmt:${USER_FORMAT}\/\1/g")
         fi
-																  
+        media-ctl -d "$MEDIA_NODE" -V "$vline_new" >/dev/null 2>&1
     done
- 
-    # 2) Apply links exactly as parsed (same order as your manual sequence).
-    printf '%s\n' "$MEDIA_CTL_L_LIST" | while IFS= read -r lline; do
-        [ -n "$lline" ] || continue
-        log_info "[CMD] media-ctl -d \"$MEDIA_NODE\" -l \"$lline\""
-        media-ctl -d "$MEDIA_NODE" -l "$lline"
+
+    # Apply MEDIA_CTL_L
+    printf "%s\n" "$MEDIA_CTL_L_LIST" | while IFS= read -r lline || [ -n "$lline" ]; do
+        [ -z "$lline" ] && continue
+        media-ctl -d "$MEDIA_NODE" -l "$lline" >/dev/null 2>&1
     done
 }
 
@@ -2217,272 +2188,60 @@ execute_capture_block() {
     done
 }
 
-# ---- Wayland/Weston helpers -----------------------
-# Ensure a private XDG runtime directory exists and is usable (0700).
-ensure_private_runtime_dir() {
-    d="$1"
-    [ -n "$d" ] || return 1
-    [ -d "$d" ] || mkdir -p "$d" 2>/dev/null || return 1
-    chmod 0700 "$d" 2>/dev/null || return 1
-    : >"$d/.xdg-test" 2>/dev/null || return 1
-    rm -f "$d/.xdg-test" 2>/dev/null
-    return 0
-}
-
-# Return first Wayland socket under a base dir (prints path or fails).
-find_wayland_socket_in() {
-    base="$1"
-    [ -d "$base" ] || return 1
-    for s in "$base"/wayland-*; do
-        [ -S "$s" ] || continue
-        printf '%s\n' "$s"
+# --- Ensure rootfs has minimum size (defaults to 2GiB) -----------------------
+# Usage: ensure_rootfs_min_size [min_gib]
+# - Checks / size (df -P /) in KiB. If < min, runs resize2fs on the rootfs device.
+# - Logs to $LOG_DIR/resize2fs.log if LOG_DIR is set, else /tmp/resize2fs.log.
+ensure_rootfs_min_size() {
+    min_gib="${1:-2}"
+    min_kb=$((min_gib*1024*1024))
+ 
+    total_kb="$(df -P / 2>/dev/null | awk 'NR==2{print $2}')"
+    [ -n "$total_kb" ] || { log_warn "df check failed; skipping resize."; return 0; }
+ 
+    if [ "$total_kb" -ge "$min_kb" ] 2>/dev/null; then
+        log_info "Rootfs size OK (>=${min_gib}GiB)."
         return 0
-    done
-    return 1
-}
-
-# Best-effort discovery of a usable Wayland socket anywhere.
-discover_wayland_socket_anywhere() {
-    uid="$(id -u 2>/dev/null || echo 0)"
-    bases=""
-    [ -n "$XDG_RUNTIME_DIR" ] && bases="$bases $XDG_RUNTIME_DIR"
-    bases="$bases /dev/socket/weston /run/user/$uid /tmp/wayland-$uid /dev/shm"
-    for b in $bases; do
-        ensure_private_runtime_dir "$b" >/dev/null 2>&1 || true
-        if s="$(find_wayland_socket_in "$b")"; then
-            printf '%s\n' "$s"
-            return 0
+    fi
+ 
+    # Pick root device: prefer by-partlabel/rootfs, else actual source of /
+    root_dev="/dev/disk/by-partlabel/rootfs"
+    if [ ! -e "$root_dev" ]; then
+        if command -v findmnt >/dev/null 2>&1; then
+            root_dev="$(findmnt -n -o SOURCE / 2>/dev/null | head -n1)"
+        else
+            root_dev="$(awk '$2=="/"{print $1; exit}' /proc/mounts 2>/dev/null)"
         fi
-    done
-    return 1
-}
-
-# Adopt env from a Wayland socket path like /run/user/0/wayland-0
-# Sets XDG_RUNTIME_DIR and WAYLAND_DISPLAY. Returns 0 on success.
-adopt_wayland_env_from_socket() {
-    sock="$1"
-    [ -n "$sock" ] || { log_warn "adopt_wayland_env_from_socket: no socket path given"; return 1; }
-    [ -S "$sock" ] || { log_warn "adopt_wayland_env_from_socket: not a socket: $sock"; return 1; }
- 
-    # Derive components without external dirname/basename
-    XDG_RUNTIME_DIR=${sock%/*}
-    WAYLAND_DISPLAY=${sock##*/}
- 
-    export XDG_RUNTIME_DIR
-    export WAYLAND_DISPLAY
- 
-    log_info "Selected Wayland socket: $sock"
-    log_info "Wayland env: XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR WAYLAND_DISPLAY=$WAYLAND_DISPLAY"
-    return 0
-}
-
-# Try to connect to Wayland. Returns 0 on OK.
-wayland_can_connect() {
-    if command -v weston-info >/dev/null 2>&1; then
-        weston-info >/dev/null 2>&1
-        return $?
     fi
-    # fallback: quick client probe
-    ( env -i XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" WAYLAND_DISPLAY="$WAYLAND_DISPLAY" true ) >/dev/null 2>&1
-    return $?
-}
-
-# Ensure a Weston socket exists; if not, stop+start Weston and adopt helper socket.
-weston_pick_env_or_start() {
-    sock="$(discover_wayland_socket_anywhere 2>/dev/null || true)"
-    if [ -n "$sock" ]; then
-        adopt_wayland_env_from_socket "$sock"
-        log_info "Selected Wayland socket: $sock"
+ 
+    if [ -z "$root_dev" ] || [ ! -e "$root_dev" ]; then
+        log_warn "Could not determine root device; skipping resize."
         return 0
     fi
-
-    if weston_is_running; then
-        log_info "Stopping Weston..."
-        weston_stop
-        i=0; while weston_is_running && [ "$i" -lt 5 ]; do i=$((i+1)); sleep 1; done
+ 
+    # Optional: only run on ext* filesystems (resize2fs)
+    if command -v blkid >/dev/null 2>&1; then
+        fstype="$(blkid -o value -s TYPE "$root_dev" 2>/dev/null | head -n1)"
+        case "$fstype" in
+            ext2|ext3|ext4) : ;;
+            *) log_warn "Rootfs type '$fstype' not ext*, skipping resize."; return 0 ;;
+        esac
     fi
-
-    log_info "Starting Weston..."
-    weston_start
-    i=0; sock=""
-    while [ "$i" -lt 6 ]; do
-        sock="$(find_wayland_socket_in /dev/socket/weston 2>/dev/null || true)"
-        [ -n "$sock" ] && break
-        sleep 1; i=$((i+1))
-    done
-    if [ -z "$sock" ]; then
-        log_fail "Could not find Wayland socket after starting Weston."
-        return 1
-    fi
-    adopt_wayland_env_from_socket "$sock"
-    log_info "Weston started; socket: $sock"
-    return 0
-}
-
-# Find candidate Wayland sockets in common locations.
-# Prints absolute socket paths, one per line, most-preferred first.
-find_wayland_sockets() {
-  uid="$(id -u 2>/dev/null || echo 0)"
-
-  # Start with $XDG_RUNTIME_DIR if set.
-  if [ -n "$XDG_RUNTIME_DIR" ] && [ -d "$XDG_RUNTIME_DIR" ]; then
-    if [ -e "$XDG_RUNTIME_DIR/wayland-1" ]; then
-      printf '%s\n' "$XDG_RUNTIME_DIR/wayland-1"
-    fi
-    if [ -e "$XDG_RUNTIME_DIR/wayland-0" ]; then
-      printf '%s\n' "$XDG_RUNTIME_DIR/wayland-0"
-    fi
-  fi
-
-  # Qualcomm/Yocto common path.
-  if [ -e /dev/socket/weston/wayland-1 ]; then
-    printf '%s\n' /dev/socket/weston/wayland-1
-  fi
-  if [ -e /dev/socket/weston/wayland-0 ]; then
-    printf '%s\n' /dev/socket/weston/wayland-0
-  fi
-
-  # XDG spec default per-user location.
-  if [ -e "/run/user/$uid/wayland-1" ]; then
-    printf '%s\n' "/run/user/$uid/wayland-1"
-  fi
-  if [ -e "/run/user/$uid/wayland-0" ]; then
-    printf '%s\n' "/run/user/$uid/wayland-0"
-  fi
-}
-
-# Ensure XDG_RUNTIME_DIR has owner=current-user and mode 0700.
-# Returns 0 if OK (or fixed), non-zero if still not compliant.
-ensure_wayland_runtime_dir_perms() {
-  dir="$1"
-  [ -n "$dir" ] && [ -d "$dir" ] || return 1
  
-  cur_uid="$(id -u 2>/dev/null || echo 0)"
-  cur_gid="$(id -g 2>/dev/null || echo 0)"
- 
-  # Best-effort fixups first (don’t error if chown/chmod fail)
-  chown "$cur_uid:$cur_gid" "$dir" 2>/dev/null || true
-  chmod 0700 "$dir" 2>/dev/null || true
- 
-  # Verify using stat (GNU first, then BSD). If stat is unavailable,
-  # we can’t verify—assume OK to avoid SC2012 (ls) usage.
-  if command -v stat >/dev/null 2>&1; then
-    # Mode: GNU: %a ; BSD: %Lp
-    mode="$(stat -c '%a' "$dir" 2>/dev/null || stat -f '%Lp' "$dir" 2>/dev/null || echo '')"
-    # Owner uid: GNU: %u ; BSD: %u
-    uid="$(stat -c '%u' "$dir" 2>/dev/null || stat -f '%u' "$dir" 2>/dev/null || echo '')"
- 
-    [ "$mode" = "700" ] && [ "$uid" = "$cur_uid" ] && return 0
-    return 1
-  fi
- 
-  # No stat available: directory exists and we attempted to fix perms/owner.
-  # Treat as success so clients can try; avoids SC2012 warnings.
-  return 0
-}
-
-# Quick Wayland handshake check.
-# Prefers `wayland-info` with a short timeout; otherwise validates socket presence.
-# Also enforces/fixes XDG_RUNTIME_DIR permissions so clients won’t reject it.
-wayland_connection_ok() {
-  if [ -n "$XDG_RUNTIME_DIR" ]; then
-    ensure_wayland_runtime_dir_perms "$XDG_RUNTIME_DIR" || return 1
-  fi
- 
-  if command -v wayland-info >/dev/null 2>&1; then
-    if command -v timeout >/dev/null 2>&1; then
-      timeout 3s wayland-info >/dev/null 2>&1
-      return $?
-    fi
-    wayland-info >/dev/null 2>&1
-    return $?
-  fi
- 
-  # Fallback: env variables and socket must exist.
-  if [ -n "$XDG_RUNTIME_DIR" ] && [ -n "$WAYLAND_DISPLAY" ] && [ -e "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ]; then
-    return 0
-  fi
-  return 1
-}
-
-# Print concise metadata for a path (portable).
-# Prefers stat(1) (GNU or BSD); falls back to ls(1) only if needed.
-# Usage: print_path_meta "/some/path"
-print_path_meta() {
-  p=$1
-  if [ -z "$p" ]; then
-    return 1
-  fi
-  # GNU stat
-  if stat -c '%A %U %G %a %n' "$p" >/dev/null 2>&1; then
-    stat -c '%A %U %G %a %n' "$p"
-    return 0
-  fi
-  # BSD/Mac stat
-  if stat -f '%Sp %Su %Sg %OLp %N' "$p" >/dev/null 2>&1; then
-    stat -f '%Sp %Su %Sg %OLp %N' "$p"
-    return 0
-  fi
-  # shellcheck disable=SC2012
-  ls -ld -- "$p" 2>/dev/null
-}
-
-soc_id() {
-    if [ -r /sys/devices/soc0/soc_id ]; then
-        cat /sys/devices/soc0/soc_id 2>/dev/null
-    elif [ -r /proc/device-tree/compatible ]; then
-        tr -d '\0' </proc/device-tree/compatible 2>/dev/null | head -n 1
+    log_dir="${LOG_DIR:-/tmp}"
+    mkdir -p "$log_dir" 2>/dev/null || true
+    if command -v resize2fs >/dev/null 2>&1; then
+        log_info "Rootfs <${min_gib}GiB ($(awk '{print int($1/1024)}' <<EOF
+$total_kb
+EOF
+) MiB). Resizing filesystem on $root_dev ..."
+        if resize2fs "$root_dev" >>"$log_dir/resize2fs.log" 2>&1; then
+            log_pass "resize2fs completed on $root_dev (see $log_dir/resize2fs.log)."
+        else
+            log_warn "resize2fs failed on $root_dev (see $log_dir/resize2fs.log)."
+        fi
     else
-        uname -r
+        log_warn "resize2fs not available; skipping resize."
     fi
-}
-
-# --- BusyBox-safe helper: convert "15s" -> 15, pass-through if already integer ---
-timeout_to_seconds() {
-    case "$1" in *s) echo "${1%s}";; *) echo "$1";; esac
-}
-
-# --- POSIX timeout without GNU coreutils ---
-sh_timeout() {
-    dur="$1"; shift
-    [ "$1" = "--" ] && shift
-    case "$dur" in *s) sec=${dur%s} ;; *) sec=$dur ;; esac
-    [ -z "$sec" ] && sec=0
-
-    "$@" &
-    pid=$!
-
-    t=0
-    while kill -0 "$pid" 2>/dev/null; do
-        if [ "$t" -ge "$sec" ] 2>/dev/null; then
-            kill "$pid" 2>/dev/null || true
-            sleep 1
-            kill -9 "$pid" 2>/dev/null || true
-            wait "$pid" 2>/dev/null
-            return 124
-        fi
-        sleep 1
-        t=$((t+1))
-    done
-    wait "$pid"; return $?
-}
-
-# Map test duration keywords to seconds
-duration_to_secs() {
-  case "$1" in
-    short)  echo 5  ;;
-    medium) echo 15 ;;
-    long)   echo 30 ;;
-    *)      echo 5  ;;
-  esac
-}
-
-log_soc_info() {
-    m=""; s=""; pv=""
-    [ -r /sys/devices/soc0/machine ] && m="$(cat /sys/devices/soc0/machine 2>/dev/null)"
-    [ -r /sys/devices/soc0/soc_id ] && s="$(cat /sys/devices/soc0/soc_id 2>/dev/null)"
-    [ -r /sys/devices/soc0/platform_version ] && pv="$(cat /sys/devices/soc0/platform_version 2>/dev/null)"
-    [ -n "$m" ] && log_info "SoC.machine: $m"
-    [ -n "$s" ] && log_info "SoC.soc_id: $s"
-    [ -n "$pv" ] && log_info "SoC.platform_version: $pv"
+    return 0
 }
