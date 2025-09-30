@@ -1582,17 +1582,82 @@ retry_command() {
     return 1
 }
 
-# Connect using nmcli with retries (returns 0 on success)
+# Connect to Wi-Fi using nmcli, with fallback when key-mgmt is required
 wifi_connect_nmcli() {
     iface="$1"
     ssid="$2"
     pass="$3"
-    if command -v nmcli >/dev/null 2>&1; then
-        log_info "Trying to connect using nmcli..."
-        retry_command "nmcli dev wifi connect \"$ssid\" password \"$pass\" ifname \"$iface\" 2>&1 | tee nmcli.log" 3 3
-        return $?
+
+    if ! command -v nmcli >/dev/null 2>&1; then
+        return 1
     fi
-    return 1
+
+    log_info "Trying to connect using nmcli..."
+    mkdir -p "${LOG_DIR:-.}" 2>/dev/null || true
+    nm_log="${LOG_DIR:-.}/nmcli_${iface}_$(printf '%s' "$ssid" | tr ' /' '__').log"
+
+    # First try the simple connect path (what you already had)
+    if [ -n "$pass" ]; then
+        retry_command "nmcli dev wifi connect \"$ssid\" password \"$pass\" ifname \"$iface\" 2>&1 | tee \"$nm_log\"" 3 3
+    else
+        retry_command "nmcli dev wifi connect \"$ssid\" ifname \"$iface\" 2>&1 | tee \"$nm_log\"" 3 3
+    fi
+    rc=$?
+    [ $rc -eq 0 ] && return 0
+
+    # Look for the specific error and fall back to creating a connection profile
+    if grep -qi '802-11-wireless-security\.key-mgmt.*missing' "$nm_log"; then
+        log_warn "nmcli connect complained about missing key-mgmt; creating an explicit connection profile..."
+
+        nmcli -t -f WIFI nm status >/dev/null 2>&1 || nmcli r wifi on >/dev/null 2>&1 || true
+        nmcli dev set "$iface" managed yes >/dev/null 2>&1 || true
+        nmcli dev disconnect "$iface" >/dev/null 2>&1 || true
+        nmcli dev wifi rescan >/dev/null 2>&1 || true
+
+        con_name="$ssid"
+        # If a connection with the same name exists, drop it to avoid conflicts
+        if nmcli -t -f NAME con show 2>/dev/null | grep -Fxq "$con_name"; then
+            nmcli con delete "$con_name" >/dev/null 2>&1 || true
+        fi
+
+        if [ -n "$pass" ]; then
+            # Try WPA2 PSK first (most common)
+            if nmcli con add type wifi ifname "$iface" con-name "$con_name" ssid "$ssid" \
+                   wifi-sec.key-mgmt wpa-psk wifi-sec.psk "$pass" >>"$nm_log" 2>&1; then
+                if nmcli con up "$con_name" ifname "$iface" >>"$nm_log" 2>&1; then
+                    log_pass "Connected to $ssid via explicit profile (wpa-psk)."
+                    return 0
+                fi
+            fi
+
+            # If that failed, try WPA3-Personal (SAE), some APs require it
+            log_warn "Profile up failed; trying WPA3 (sae) profile..."
+            nmcli con delete "$con_name" >/dev/null 2>&1 || true
+            if nmcli con add type wifi ifname "$iface" con-name "$con_name" ssid "$ssid" \
+                   wifi-sec.key-mgmt sae wifi-sec.psk "$pass" >>"$nm_log" 2>&1; then
+                if nmcli con up "$con_name" ifname "$iface" >>"$nm_log" 2>&1; then
+                    log_pass "Connected to $ssid via explicit profile (sae)."
+                    return 0
+                fi
+            fi
+        else
+            # Open network (no passphrase)
+            if nmcli con add type wifi ifname "$iface" con-name "$con_name" ssid "$ssid" \
+                   wifi-sec.key-mgmt none >>"$nm_log" 2>&1; then
+                if nmcli con up "$con_name" ifname "$iface" >>"$nm_log" 2>&1; then
+                    log_pass "Connected to open network $ssid."
+                    return 0
+                fi
+            fi
+        fi
+
+        log_fail "Failed to connect to $ssid even after explicit key-mgmt profile. See $nm_log"
+        return 1
+    fi
+
+    # Different error — just bubble up the original failure
+    log_fail "nmcli failed to connect to $ssid. See $nm_log"
+    return $rc
 }
 
 # Connect using wpa_supplicant+udhcpc with retries (returns 0 on success)
