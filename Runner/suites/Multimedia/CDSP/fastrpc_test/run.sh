@@ -138,16 +138,6 @@ cmd_to_string() {
     printf "%s" "$out"
 }
 
-log_soc_info() {
-    m=""; s=""; pv=""
-    [ -r /sys/devices/soc0/machine ] && m="$(cat /sys/devices/soc0/machine 2>/dev/null)"
-    [ -r /sys/devices/soc0/soc_id ] && s="$(cat /sys/devices/soc0/soc_id 2>/dev/null)"
-    [ -r /sys/devices/soc0/platform_version ] && pv="$(cat /sys/devices/soc0/platform_version 2>/dev/null)"
-    [ -n "$m" ] && log_info "SoC.machine: $m"
-    [ -n "$s" ] && log_info "SoC.soc_id: $s"
-    [ -n "$pv" ] && log_info "SoC.platform_version: $pv"
-}
-
 log_dsp_remoteproc_status() {
     fw_list="adsp cdsp cdsp0 cdsp1 sdsp gdsp0 gdsp1"
     any=0
@@ -210,8 +200,8 @@ fi
 case "$BIN_DIR" in
     /bin)
         if [ "${ALLOW_BIN_FASTRPC:-0}" -ne 1 ]; then
-            log_fail "Refusing /bin by default (set ALLOW_BIN_FASTRPC=1 or use --bin-dir /usr/local/bin)"
-            echo "$TESTNAME : FAIL" >"$RESULT_FILE"
+	    log_skip "$TESTNAME SKIP - unsupported layout: /bin. Set ALLOW_BIN_FASTRPC=1 or pass --bin-dir."
+            echo "$TESTNAME : SKIP" >"$RESULT_FILE"
             exit 1
         fi
     ;;
@@ -221,8 +211,8 @@ RUN_DIR="$BIN_DIR"
 RUN_BIN="$RUN_DIR/fastrpc_test"
 
 if [ ! -x "$RUN_BIN" ]; then
-    log_fail "fastrpc_test not executable at: $RUN_BIN"
-    echo "$TESTNAME : FAIL" >"$RESULT_FILE"
+    log_skip "$TESTNAME SKIP - fastrpc_test not installed (expected at: $RUN_BIN)"
+    echo "$TESTNAME : SKIP" >"$RESULT_FILE"
     exit 1
 fi
 
@@ -259,7 +249,8 @@ log_info "LD_LIBRARY_PATH=${LD_LIBRARY_PATH}"
 [ -n "$CDSP_LIBRARY_PATH" ] && log_info "CDSP_LIBRARY_PATH=${CDSP_LIBRARY_PATH}"
 [ -n "$SDSP_LIBRARY_PATH" ] && log_info "SDSP_LIBRARY_PATH=${SDSP_LIBRARY_PATH}"
 # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
-
+# Ensure /usr/lib/dsp has the expected DSP artifacts (generic, idempotent)
+ensure_usr_lib_dsp_symlinks
 # Log *dsp remoteproc statuses via existing helpers
 log_dsp_remoteproc_status
 
@@ -289,7 +280,7 @@ case "$DOMAIN" in
         log_info "Domain auto-picked: -d $DOMAIN (CDSP=3, ADSP=0, SDSP=2)"
         ;;
     * )
-        log_warn "Invalid domain '$DOMAIN'; auto-picking"
+        log_warn "Invalid domain '$DOMAIN' auto-picking"
         DOMAIN="$(pick_default_domain)"
         ;;
 esac
@@ -375,7 +366,7 @@ while [ "$i" -le "$REPEAT" ]; do
     (
         cd "$RUN_DIR" || exit 127
         if [ $HAVE_STDBUF -eq 1 ]; then
-            run_with_timeout "$TIMEOUT" stdbuf -oL -eL ./fastrpc_test "$@"
+             runWithTimeoutIfSet stdbuf -oL -eL ./fastrpc_test "$@"
         elif [ $HAVE_SCRIPT -eq 1 ]; then
             cmd_str="./fastrpc_test$(cmd_to_string "$@")"
             if [ -n "$TIMEOUT" ] && [ $HAVE_TIMEOUT -eq 1 ]; then
@@ -384,7 +375,7 @@ while [ "$i" -le "$REPEAT" ]; do
                 script -q -c "$cmd_str" /dev/null
             fi
         else
-            run_with_timeout "$TIMEOUT" ./fastrpc_test "$@"
+            runWithTimeoutIfSet ./fastrpc_test "$@"
         fi
     ) >"$iter_log" 2>&1
     rc=$?
