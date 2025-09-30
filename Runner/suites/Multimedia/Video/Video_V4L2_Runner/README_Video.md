@@ -231,8 +231,8 @@ VIDEO_FW_BACKUP_DIR=/opt ./run.sh --platform kodiak --stack upstream
 
 ### Ensure Wi‑Fi is used for downloads (if needed)
 ```sh
-export SSID="Hydra"
-export PASSWORD="K5x48Vz3"
+export SSID="AP Name"
+export PASSWORD="Password"
 ./run.sh --extract-input-clips true
 ```
 
