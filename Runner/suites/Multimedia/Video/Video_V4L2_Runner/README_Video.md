@@ -153,9 +153,9 @@ If the target is offline when a clip bundle is needed:
 
 **Provide credentials via:**
 ```sh
-export SSID="Hydra"
-export PASSWORD="K5x48Vz3"
-# or create ./ssid_list.txt with:  Hydra K5x48Vz3
+export SSID="WIFI_SSID"
+export PASSWORD="WIFI_PASSWORD"
+# or create ./ssid_list.txt with:  WIFI_PASSWORD WIFI_PASSWORD
 ```
 
 ---
@@ -231,8 +231,8 @@ VIDEO_FW_BACKUP_DIR=/opt ./run.sh --platform kodiak --stack upstream
 
 ### Ensure Wi‑Fi is used for downloads (if needed)
 ```sh
-export SSID="AP Name"
-export PASSWORD="Password"
+export SSID="WIFI_SSID"
+export PASSWORD="WIFI_PASSWORD"
 ./run.sh --extract-input-clips true
 ```
 
