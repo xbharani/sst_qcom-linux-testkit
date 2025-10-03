@@ -716,6 +716,25 @@ run_with_timeout() {
     return $status
 }
 
+# Only apply a timeout if TIMEOUT is set; prefer `timeout`; avoid functestlib here
+runWithTimeoutIfSet() {
+  # Normalize TIMEOUT: treat empty or non-numeric as 0
+  t="${TIMEOUT:-}"
+  case "$t" in
+    ''|*[!0-9]*)
+      t=0
+      ;;
+  esac
+ 
+  if [ "$t" -gt 0 ] && command -v run_with_timeout >/dev/null 2>&1; then
+    # Correct signature: run_with_timeout <seconds> <cmd> [args...]
+    run_with_timeout "$t" "$@"
+  else
+    # No timeout -> run command directly
+    "$@"
+  fi
+}
+
 # DHCP client logic (dhclient and udhcpc with timeouts)
 run_dhcp_client() {
     iface="$1"
@@ -2309,4 +2328,287 @@ EOF
         log_warn "resize2fs not available; skipping resize."
     fi
     return 0
+}
+
+log_soc_info() {
+    m=""; s=""; pv=""
+    [ -r /sys/devices/soc0/machine ] && m="$(cat /sys/devices/soc0/machine 2>/dev/null)"
+    [ -r /sys/devices/soc0/soc_id ] && s="$(cat /sys/devices/soc0/soc_id 2>/dev/null)"
+    [ -r /sys/devices/soc0/platform_version ] && pv="$(cat /sys/devices/soc0/platform_version 2>/dev/null)"
+    [ -n "$m" ] && log_info "SoC.machine: $m"
+    [ -n "$s" ] && log_info "SoC.soc_id: $s"
+    [ -n "$pv" ] && log_info "SoC.platform_version: $pv"
+}
+
+###############################################################################
+# Platform detection (SoC / Target / Machine / OS) — POSIX, no sourcing files
+# Sets & exports:
+#   PLATFORM_KERNEL, PLATFORM_ARCH, PLATFORM_UNAME_S, PLATFORM_HOSTNAME
+#   PLATFORM_SOC_MACHINE, PLATFORM_SOC_ID, PLATFORM_SOC_FAMILY
+#   PLATFORM_DT_MODEL, PLATFORM_DT_COMPAT
+#   PLATFORM_OS_LIKE, PLATFORM_OS_NAME
+#   PLATFORM_TARGET, PLATFORM_MACHINE
+###############################################################################
+detect_platform() {
+    # --- Basic uname/host ---
+    PLATFORM_KERNEL="$(uname -r 2>/dev/null)"
+    PLATFORM_ARCH="$(uname -m 2>/dev/null)"
+    PLATFORM_UNAME_S="$(uname -s 2>/dev/null)"
+    PLATFORM_HOSTNAME="$(hostname 2>/dev/null)"
+ 
+    # --- soc0 details ---
+    if [ -r /sys/devices/soc0/machine ]; then
+        PLATFORM_SOC_MACHINE="$(cat /sys/devices/soc0/machine 2>/dev/null)"
+    else
+        PLATFORM_SOC_MACHINE=""
+    fi
+ 
+    if [ -r /sys/devices/soc0/soc_id ]; then
+        PLATFORM_SOC_ID="$(cat /sys/devices/soc0/soc_id 2>/dev/null)"
+    else
+        PLATFORM_SOC_ID=""
+    fi
+ 
+    if [ -r /sys/devices/soc0/family ]; then
+        PLATFORM_SOC_FAMILY="$(cat /sys/devices/soc0/family 2>/dev/null)"
+    else
+        PLATFORM_SOC_FAMILY=""
+    fi
+ 
+    # --- Device Tree model / compatible (strip NULs) ---
+    if [ -r /proc/device-tree/model ]; then
+        PLATFORM_DT_MODEL="$(tr -d '\000' </proc/device-tree/model 2>/dev/null | head -n 1)"
+    else
+        PLATFORM_DT_MODEL=""
+    fi
+ 
+    PLATFORM_DT_COMPAT=""
+    if [ -d /proc/device-tree ]; then
+        for f in /proc/device-tree/compatible /proc/device-tree/*/compatible; do
+            if [ -f "$f" ]; then
+                PLATFORM_DT_COMPAT="$(tr -d '\000' <"$f" 2>/dev/null | tr '\n' ' ')"
+                break
+            fi
+        done
+    fi
+ 
+    # --- OS (parse, do not source /etc/os-release) ---
+    PLATFORM_OS_LIKE=""
+    PLATFORM_OS_NAME=""
+    if [ -r /etc/os-release ]; then
+        PLATFORM_OS_LIKE="$(
+            awk -F= '$1=="ID_LIKE"{gsub(/"/,"",$2); print $2}' /etc/os-release 2>/dev/null
+        )"
+        if [ -z "$PLATFORM_OS_LIKE" ]; then
+            PLATFORM_OS_LIKE="$(
+                awk -F= '$1=="ID"{gsub(/"/,"",$2); print $2}' /etc/os-release 2>/dev/null
+            )"
+        fi
+        PLATFORM_OS_NAME="$(
+            awk -F= '$1=="PRETTY_NAME"{gsub(/"/,"",$2); print $2}' /etc/os-release 2>/dev/null
+        )"
+    fi
+ 
+    # --- Target guess (mutually-exclusive; generic names only) ---
+    lc_compat="$(printf '%s %s' "$PLATFORM_DT_MODEL" "$PLATFORM_DT_COMPAT" \
+                 | tr '[:upper:]' '[:lower:]')"
+ 
+    case "$lc_compat" in
+        # Kodiak: qcs6490 / RB3 Gen2
+        *qcs6490*|*kodiak*|*rb3gen2*|*rb3-gen2*|*rb3*gen2*)
+            PLATFORM_TARGET="Kodiak"
+            ;;
+        # LeMans family: qcs9100, qcs9075, SA8775P, IQ-9075-EVK (accept 'lemand' too)
+        *qcs9100*|*qcs9075*|*lemans*|*lemand*|*sa8775p*|*iq-9075-evk*)
+            PLATFORM_TARGET="LeMans"
+            ;;
+        # Monaco: qcs8300
+        *qcs8300*|*monaco*)
+            PLATFORM_TARGET="Monaco"
+            ;;
+        # Agatti: QRB2210 RB1 Core Kit
+        *qrb2210*|*agatti*|*rb1-core-kit*)
+            PLATFORM_TARGET="Agatti"
+            ;;
+        # Talos: QCS615 ADP Air
+        *qcs615*|*talos*|*adp-air*)
+            PLATFORM_TARGET="Talos"
+            ;;
+        *)
+            PLATFORM_TARGET="unknown"
+            ;;
+    esac
+ 
+    # --- Human-friendly machine name ---
+    if [ -n "$PLATFORM_DT_MODEL" ]; then
+        PLATFORM_MACHINE="$PLATFORM_DT_MODEL"
+    else
+        if [ -n "$PLATFORM_SOC_MACHINE" ]; then
+            PLATFORM_MACHINE="$PLATFORM_SOC_MACHINE"
+        else
+            PLATFORM_MACHINE="$PLATFORM_HOSTNAME"
+        fi
+    fi
+ 
+    # Export for callers (and to silence SC2034 in this file)
+    export \
+      PLATFORM_KERNEL PLATFORM_ARCH PLATFORM_UNAME_S PLATFORM_HOSTNAME \
+      PLATFORM_SOC_MACHINE PLATFORM_SOC_ID PLATFORM_SOC_FAMILY \
+      PLATFORM_DT_MODEL PLATFORM_DT_COMPAT PLATFORM_OS_LIKE PLATFORM_OS_NAME \
+      PLATFORM_TARGET PLATFORM_MACHINE
+ 
+    return 0
+}
+
+# ---------- minimal root / FS helpers (Yocto-safe, no underscores) ----------
+isroot() { uid="$(id -u 2>/dev/null || echo 1)"; [ "$uid" -eq 0 ]; }
+
+iswritabledir() { d="$1"; [ -d "$d" ] && [ -w "$d" ]; }
+
+mountpointfor() {
+  p="$1"
+  awk -v p="$p" '
+    BEGIN{best="/"; bestlen=1}
+    {
+      mp=$2
+      if (index(p, mp)==1 && length(mp)>bestlen) { best=mp; bestlen=length(mp) }
+    }
+    END{print best}
+  ' /proc/mounts 2>/dev/null
+}
+
+tryremountrw() {
+  path="$1"
+  mp="$(mountpointfor "$path")"
+  [ -n "$mp" ] || mp="/"
+  if mount -o remount,rw "$mp" 2>/dev/null; then
+    printf '%s\n' "$mp"
+    return 0
+  fi
+  return 1
+}
+
+# ---------------- DSP autolink (generic, sudo-free, no underscores) ----------------
+# Env:
+#   FASTRPC_DSP_AUTOLINK=yes|no    (default: yes)
+#   FASTRPC_DSP_SRC=/path/to/dsp   (force a source dir)
+#   FASTRPC_AUTOREMOUNT=yes|no     (default: no)  allow remount rw if needed
+#   FASTRPC_AUTOREMOUNT_RO=yes|no  (default: yes) remount ro after linking
+ensure_usr_lib_dsp_symlinks() {
+  [ "${FASTRPC_DSP_AUTOLINK:-yes}" = "yes" ] || { log_info "DSP autolink disabled" return 0; }
+ 
+  dsptgt="/usr/lib/dsp"
+ 
+  # If already populated, skip
+  if [ -d "$dsptgt" ]; then
+    if find "$dsptgt" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null | grep -q .; then
+      log_info "$dsptgt already populated, skipping DSP autolink"
+      return 0
+    fi
+  fi
+ 
+  # Choose source: explicit env wins, else discover
+  if [ -n "${FASTRPC_DSP_SRC:-}" ] && [ -d "$FASTRPC_DSP_SRC" ]; then
+    dspsrc="$FASTRPC_DSP_SRC"
+  else
+    # Best-effort platform hints (detect_platform may exist in functestlib)
+    if command -v detect_platform >/dev/null 2>&1; then detect_platform >/dev/null 2>&1 || true; fi
+    hintstr="$(printf '%s %s %s %s' \
+      "${PLATFORM_SOC_ID:-}" "${PLATFORM_DT_MODEL:-}" "${PLATFORM_DT_COMPAT:-}" "${PLATFORM_TARGET:-}" \
+      | tr '[:upper:]' '[:lower:]')"
+ 
+    candidateslist="$(find /usr/share/qcom -maxdepth 6 -type d -name dsp 2>/dev/null | sort)"
+    best=""; bestscore=-1; bestcount=-1
+    IFS='
+'
+    for d in $candidateslist; do
+      [ -d "$d" ] || continue
+      if ! find "$d" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null | grep -q .; then
+        continue
+      fi
+      score=0
+      pathlc="$(printf '%s' "$d" | tr '[:upper:]' '[:lower:]')"
+      for tok in $hintstr; do
+        [ -n "$tok" ] || continue
+        case "$pathlc" in *"$tok"*) score=$((score+1));; esac
+      done
+      cnt="$(find "$d" -mindepth 1 -maxdepth 1 -printf '.' 2>/dev/null | wc -c | tr -d ' ')"
+      if [ "$score" -gt "$bestscore" ] || { [ "$score" -eq "$bestscore" ] && [ "$cnt" -gt "$bestcount" ]; }; then
+        best="$d"; bestscore="$score"; bestcount="$cnt"
+      fi
+    done
+    unset IFS
+    dspsrc="$best"
+  fi
+ 
+  if [ -z "$dspsrc" ]; then
+    log_warn "No DSP skeleton source found under /usr/share/qcom, skipping autolink."
+    return 0
+  fi
+ 
+  # Must be root on Yocto (no sudo). If not root, skip safely.
+  if ! isroot; then
+    log_warn "Not root; cannot write to $dsptgt on Yocto (no sudo). Skipping DSP autolink."
+    return 0
+  fi
+ 
+  # Ensure target dir exists; handle read-only rootfs if requested
+  remounted=""
+  mountpt=""
+  if ! mkdir -p "$dsptgt" 2>/dev/null; then
+    if [ "${FASTRPC_AUTOREMOUNT:-no}" = "yes" ]; then
+      mountpt="$(tryremountrw "$dsptgt")" || {
+        log_warn "Rootfs read-only and remount failed, skipping DSP autolink."
+        return 0
+      }
+      remounted="yes"
+      if ! mkdir -p "$dsptgt" 2>/dev/null; then
+        log_warn "mkdir -p $dsptgt still failed after remount, skipping."
+        if [ -n "$mountpt" ] && [ "${FASTRPC_AUTOREMOUNT_RO:-yes}" = "yes" ]; then
+          mount -o remount,ro "$mountpt" 2>/dev/null || true
+        fi
+        return 0
+      fi
+    else
+      log_warn "Rootfs likely read-only. Set FASTRPC_AUTOREMOUNT=yes to remount rw automatically."
+      return 0
+    fi
+  fi
+ 
+  # If something appeared meanwhile, stop (idempotent)
+  if find "$dsptgt" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null | grep -q .; then
+    log_info "$dsptgt now contains entries, not linking from $dspsrc"
+    if [ -n "$remounted" ] && [ -n "$mountpt" ] && [ "${FASTRPC_AUTOREMOUNT_RO:-yes}" = "yes" ]; then
+      mount -o remount,ro "$mountpt" 2>/dev/null || true
+    fi
+    return 0
+  fi
+ 
+  # Link both files and directories; don't clobber existing names
+  log_info "Linking DSP artifacts from: $dspsrc → $dsptgt"
+  linked=0
+  for f in "$dspsrc"/*; do
+    [ -e "$f" ] || continue
+    base="$(basename "$f")"
+    if [ ! -e "$dsptgt/$base" ]; then
+      if ln -s "$f" "$dsptgt/$base" 2>/dev/null; then
+        linked=$((linked+1))
+      else
+        log_warn "ln -s failed: $f"
+      fi
+    fi
+  done
+ 
+  # Final visibility + sanity
+  if find "$dsptgt" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null | grep -q .; then
+    log_info "DSP autolink complete ($linked link(s))"
+    ls -l "$dsptgt" 2>/dev/null | sed 's/^/[INFO] /' || true
+  else
+    log_warn "DSP autolink finished but $dsptgt is still empty, source may contain only nested content or FS is RO."
+  fi
+ 
+  # Optionally restore read-only
+  if [ -n "$remounted" ] && [ -n "$mountpt" ] && [ "${FASTRPC_AUTOREMOUNT_RO:-yes}" = "yes" ]; then
+    mount -o remount,ro "$mountpt" 2>/dev/null || true
+  fi
 }
