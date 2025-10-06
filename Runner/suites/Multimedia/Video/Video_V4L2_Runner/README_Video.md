@@ -14,35 +14,28 @@ The suite includes a **reboot-free video stack switcher** (upstream ↔ downstre
 
 ---
 
-## What’s New (since 2025‑09‑26)
+## What’s New (since 2025‑10‑03)
 
-- **Pre-download rootfs auto‑resize**
-  - New `ensure_rootfs_min_size` (now in `functestlib.sh`) verifies `/` has at least **2 GiB** available and, if the root partition is `/dev/disk/by-partlabel/rootfs`, runs:
-    ```sh
-    resize2fs /dev/disk/by-partlabel/rootfs
-    ```
-  - Invoked **before** any clip bundle download.
+- **Network stabilization delay (post-connect)**  
+  After an interface comes up (DHCP/DNS), the runner now sleeps for a short grace period before the first TLS download to avoid immediate failures.
+  - Env knob: `NET_STABILIZE_SLEEP` (default **5** seconds).
 
-- **Kodiak upstream: auto‑install backup firmware before switching**
-  - `video_kodiak_install_firmware` (in `lib_video.sh`) looks for a recent backup blob under **`$VIDEO_FW_BACKUP_DIR`** (defaults to `/opt/video-fw-backups`) **and legacy `/opt` patterns**, then copies it to:
-    ```
-    /lib/firmware/qcom/vpu/vpu20_p1_gen2.mbn
-    ```
-  - Attempts **remoteproc stop → firmware swap → start**, with fallback to **module reload** and **platform unbind/bind**.
-  - Automatically runs when `--platform kodiak --stack upstream`.
+- **Downloader timeouts & retries (BusyBox‑friendly)**  
+  Clip bundle downloads honor BusyBox wget timeouts/retries and perform a final TLS‑lenient attempt when the clock is not yet sane.
+  - Env knobs: `WGET_TIMEOUT_SECS` (default **120**), `WGET_TRIES` (default **2**).
 
-- **Network bootstrap before downloads (Ethernet → Wi‑Fi)**
-  - `ensure_network_online` first tries wired DHCP; if still offline and **Wi‑Fi credentials are available**, it attempts:
-    1) `nmcli dev wifi connect` (with a **key‑mgmt fallback** that creates a PSK connection if NM complains: `802-11-wireless-security.key-mgmt: property is missing`), then
-    2) `wpa_supplicant + udhcpc` as a final fallback.
-  - Credentials are taken from environment **`SSID`/`PASSWORD`** or an optional `./ssid_list.txt` (first line: `ssid password`).
+- **SKIP instead of FAIL when offline**  
+  If the network is unreachable (or time is invalid for TLS) *and* required media clips are missing, **decode** cases are *SKIPPED* rather than failed. Encode cases continue to run.
 
-- **App path hardening**
-  - If `--app` points to a file that exists but is not executable, the runner does a best‑effort `chmod +x` and proceeds.
+- **App launch & inter‑test pacing**  
+  To reduce flakiness from back‑to‑back runs, the runner adds small sleeps **before** launching `iris_v4l2_test` and **between** tests.
+  - Env knobs: `VIDEO_APP_LAUNCH_SLEEP` (default **1** second), `VIDEO_INTER_TEST_SLEEP` (default **1** second).
 
-- **Platform‑aware hard gates & clearer logging**
-  - Upstream/Downstream validation is **platform specific** (lemans/monaco vs. kodiak).
-  - udev refresh + stale node pruning for `/dev/video*` and `/dev/media*` after any stack change.
+- **Module operations: gentle waits & retries**  
+  Module unload/load and blacklist scrubbing paths include short sleeps and a retry pass (`modprobe -r` retry with a small delay, 1s delays around remoteproc/module reloads). No new CLI needed.
+
+- **CLI parity**  
+  `--stack both` is supported to run the suite twice in one invocation (BASE/upstream pass then OVERLAY/downstream pass).
 
 ---
 
@@ -51,7 +44,7 @@ The suite includes a **reboot-free video stack switcher** (upstream ↔ downstre
 - Pure **V4L2** driver-level tests using `iris_v4l2_test`
 - **Encode** (YUV → H.264/H.265) and **Decode** (H.264/H.265/VP9 → YUV)
 - **Yocto**-friendly, POSIX shell with BusyBox-safe paths
-- Parse & run multiple JSON configs; auto-detect **encode/decode**
+- Parse & run multiple JSON configs, auto-detect **encode/decode**
 - **Auto-fetch** missing input clips (retries, BusyBox `wget` compatible)
 - **Rootfs size guard** (auto‑resize) **before** fetching assets
 - **Network bootstrap** (Ethernet → Wi‑Fi via `nmcli`/`wpa_supplicant`) when needed for downloads
@@ -59,6 +52,25 @@ The suite includes a **reboot-free video stack switcher** (upstream ↔ downstre
 - **Stack switcher**: upstream ↔ downstream without reboot
 - **Kodiak firmware live swap** with backup/restore helpers
 - **udev refresh + prune** of stale device nodes
+- **Waits/retries/sleeps** integrated across networking, downloads, module ops, and app launches (see next section)
+
+---
+
+## Stability waits, retries & timeouts (defaults & overrides)
+
+These are **environment variables** (not user‑visible CLI flags) so your LAVA job YAML can stay minimal. All are **optional**—defaults are sane.
+
+| Env Var | Default | Purpose |
+|---|---:|---|
+| `NET_STABILIZE_SLEEP` | `5` | Sleep (seconds) after link/IP assignment before first download. Applied also when already online, to debounce DNS/routes. |
+| `WGET_TIMEOUT_SECS` | `120` | BusyBox wget timeout per attempt when fetching the clip bundle. |
+| `WGET_TRIES` | `2` | BusyBox wget retry count for clip bundle. |
+| `VIDEO_APP_LAUNCH_SLEEP` | `1` | Sleep (seconds) right before launching `iris_v4l2_test` for each case. |
+| `VIDEO_INTER_TEST_SLEEP` | `1` | Sleep (seconds) between cases to allow device/udev to settle. |
+
+> Notes
+> - If download **stalls** or the system clock is invalid for TLS, the runner re-checks network health and treats it as **offline** → decode cases **SKIP** (not FAIL).
+> - Module management includes small internal waits (e.g., `modprobe -r` retry after 200ms, 1s delays around remoteproc/module reloads). These are built‑in, no extra env required.
 
 ---
 
@@ -123,7 +135,7 @@ cd <target_path>/Runner
 | `--dry-run` | Print commands only |
 | `--verbose` | Verbose runner logs |
 | `--app /path/to/iris_v4l2_test` | Override test app path |
-| `--stack auto|upstream|downstream|base|overlay|up|down` | Select target stack |
+| `--stack auto|upstream|downstream|base|overlay|up|down|both` | Select target stack (use `both` for BASE→OVERLAY two-pass) |
 | `--platform lemans|monaco|kodiak` | Force platform (else auto-detect) |
 | `--downstream-fw PATH` | **Kodiak**: path to DS firmware (e.g. `vpu20_1v.mbn`) |
 
@@ -151,12 +163,20 @@ If the target is offline when a clip bundle is needed:
      ```
    - If still offline, uses `wpa_supplicant + udhcpc`
 
+After connectivity, a **debounce wait** is applied:
+```sh
+# Default 5s (override via NET_STABILIZE_SLEEP)
+sleep "${NET_STABILIZE_SLEEP:-5}"
+```
+
 **Provide credentials via:**
 ```sh
 export SSID="WIFI_SSID"
 export PASSWORD="WIFI_PASSWORD"
-# or create ./ssid_list.txt with:  WIFI_PASSWORD WIFI_PASSWORD
+# or create ./ssid_list.txt with:  WIFI_SSID WIFI_PASSWORD
 ```
+
+When network remains unreachable and clips are missing, **decode cases are SKIPPED** (not failed).
 
 ---
 
@@ -174,6 +194,7 @@ The runner:
 1. Prints **pre/post** module snapshots and any runtime/persistent modprobe blocks
 2. Switches stacks without reboot (uses runtime blacklists under `/run/modprobe.d`)
 3. **Refreshes** `/dev/video*` & `/dev/media*` with udev and **prunes** stale nodes
+4. Applies small **waits/retries** around unload/load and de‑blacklist/blacklist paths
 
 ---
 
@@ -183,14 +204,14 @@ The runner:
 When `--stack downstream` and you pass `--downstream-fw /path/to/vpu20_1v.mbn`:
 1. The blob is copied to: `/lib/firmware/qcom/vpu/vpu20_p1_gen2.mbn`
 2. Previous image is backed up to: `/opt/video-fw-backups/vpu20_p1_gen2.mbn.<timestamp>.bak`
-3. Runner tries **remoteproc restart**, then **module reload**, then **unbind/bind**
+3. Runner tries **remoteproc restart**, then **module reload**, then **unbind/bind** (with short waits between steps)
 
 ### Upstream (restore a backup before switch)
 When `--stack upstream` on **kodiak**, the runner tries to **restore a known‑good backup** to `/lib/firmware/qcom/vpu/vpu20_p1_gen2.mbn` **before** switching:
 - Search order:
   1. `$VIDEO_FW_BACKUP_DIR` (default `/opt/video-fw-backups`), newest `vpu20_p1_gen2.mbn.*.bak`
   2. Legacy `/opt` patterns (e.g., `vpu20_p1_gen2.mbn.*.bak`)
-- Then it attempts **remoteproc restart**; falls back as needed.
+- Then it attempts **remoteproc restart**; falls back as needed (with 1s waits).
 
 **Tip:** If you maintain backups under a custom path:
 ```sh
@@ -202,9 +223,14 @@ export VIDEO_FW_BACKUP_DIR=/opt
 
 ## Examples
 
-### Run all configs with auto stack
+### Minimal: run all configs with sane defaults
 ```sh
 ./run.sh
+```
+
+### Use `both` to run BASE then OVERLAY in one job
+```sh
+./run.sh --stack both
 ```
 
 ### Force downstream on lemans/monaco
@@ -246,6 +272,22 @@ export PASSWORD="WIFI_PASSWORD"
 ./run.sh --pattern '*h265*Decoder.json'
 ```
 
+### Override waits/timeouts (optional)
+```sh
+# Debounce network right after IP assignment
+export NET_STABILIZE_SLEEP=8
+
+# BusyBox wget tuning
+export WGET_TIMEOUT_SECS=180
+export WGET_TRIES=3
+
+# Pacing iris app & tests
+export VIDEO_APP_LAUNCH_SLEEP=2
+export VIDEO_INTER_TEST_SLEEP=3
+
+./run.sh --stack upstream
+```
+
 ---
 
 ## Troubleshooting
@@ -260,6 +302,6 @@ export PASSWORD="WIFI_PASSWORD"
   The runner triggers udev and prunes stale nodes; verify udev is available and rules are active.
 
 - **Download fails**  
-  Ensure time is sane (TLS), network is reachable, and provide Wi‑Fi creds via env or `ssid_list.txt`. The downloader uses BusyBox‑compatible flags with retries.
+  Ensure time is sane (TLS), network is reachable, and provide Wi‑Fi creds via env or `ssid_list.txt`. The downloader uses BusyBox‑compatible flags with retries and a final TLS‑lenient attempt if needed. When the network remains unreachable, the runner **SKIPs** decode cases.
 
 ---

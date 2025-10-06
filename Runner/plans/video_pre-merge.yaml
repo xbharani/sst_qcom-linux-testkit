@@ -1,0 +1,55 @@
+metadata:
+  format: Lava-Test Test Definition 1.0
+  name: Video_V4L2_All
+  description: "Single YAML: pass TARGET, STACK, iris path and downstream FW; run.sh handles the rest"
+  maintainer:
+    - smuppand@qti.qualcomm.com
+  os:
+    - openembedded
+  scope:
+    - functional
+ 
+run:
+  steps:
+    - cd Runner
+    - export REPO_ROOT="$PWD"
+ 
+    # --- Job-level inputs (set per device/job) ---
+    - export TARGET="${TARGET:-}"               # e.g. Kodiak|LeMans|Monaco|Talos
+    - export STACK="${STACK:-both}"             # base|overlay|auto|both or synonyms: upstream|downstream
+    - export IRIS_BIN="${IRIS_BIN:-}"           # optional: /path/to/iris_v4l2_test
+    - export DOWNSTREAM_FW="${DOWNSTREAM_FW:-}" # optional: firmware blob for overlay
+ 
+    # Normalize STACK -> MODE (one-liner synonyms)
+    - export MODE_NORM="$(printf '%s' "$STACK" | tr '[:upper:]' '[:lower:]' | sed -e 's/^upstream$/base/' -e 's/^downstream$/overlay/')"
+    - |
+      case "$MODE_NORM" in base|overlay|auto|both) : ;; *) MODE_NORM="both" ;; esac
+      echo "TARGET=$TARGET  STACK=$STACK  MODE_NORM=$MODE_NORM"
+ 
+    # Build args for run.sh (match your CLI exactly)
+    - |
+      ARGS=""
+      [ -n "$TARGET" ] && ARGS="$ARGS --target \"$TARGET\""
+ 
+      if [ -n "$IRIS_BIN" ]; then
+        ARGS="$ARGS --iris-bin \"$IRIS_BIN\""
+      else
+        IB="$(command -v iris_v4l2_test 2>/dev/null || true)"
+        [ -n "$IB" ] && ARGS="$ARGS --iris-bin \"$IB\""
+      fi
+ 
+      [ -n "$DOWNSTREAM_FW" ] && ARGS="$ARGS --downstream-fw \"$DOWNSTREAM_FW\""
+ 
+      echo "ARGS=$ARGS"
+ 
+    # Single call: run.sh handles base/overlay/auto and 'both' via its reexec shim
+    - |
+      cd "$REPO_ROOT/suites/Multimedia/Video/Video_V4L2_Runner"
+      # shellcheck disable=SC2086
+      sh -lc "./run.sh $ARGS --mode \"$MODE_NORM\"" || true
+ 
+    # Report result (AUSanity style)
+    - "$REPO_ROOT/utils/send-to-lava.sh" "$REPO_ROOT/suites/Multimedia/Video/Video_V4L2_Runner/Video_V4L2_Runner.res" || true
+ 
+    # Optional roll-up (ignored if absent)
+    - "$REPO_ROOT/utils/result_parse.sh" || true
