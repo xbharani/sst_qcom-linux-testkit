@@ -1,6 +1,4 @@
 #!/bin/sh
-#!/bin/sh
-
 # Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 # SPDX-License-Identifier: BSD-3-Clause-Clear
 
@@ -300,18 +298,25 @@ ensure_reasonable_clock() {
     log_warn "System clock looks invalid (epoch=$now). Attempting quick time sync..."
     if command -v timedatectl >/dev/null 2>&1; then
         timedatectl set-ntp true 2>/dev/null || true
+    fi
+    grace=25
+    start="$(date +%s 2>/dev/null || echo 0)"
+    end=$((start + grace))
+    while :; do
+        cur="$(date +%s 2>/dev/null || echo 0)"
+        if [ "$cur" -ge "$cutoff" ] 2>/dev/null; then
+            log_pass "Clock synchronized."
+            return 0
+        fi
+        if [ "$cur" -ge "$end" ] 2>/dev/null; then
+            break
+        fi
         sleep 1
-    fi
-    # If no NTP client, we cannot do much more here.
-    now2="$(date +%s 2>/dev/null || echo 0)"
-    if [ "$now2" -ge "$cutoff" ] 2>/dev/null; then
-        log_pass "Clock synchronized."
-        return 0
-    fi
+    done
+ 
     log_warn "Clock still invalid; TLS downloads may fail. Treating as limited network."
     return 1
 }
-
 
 # If the tar file already exists,then function exit. Otherwise function to check the network connectivity and it will download tar from internet.
 extract_tar_from_url() {
@@ -390,7 +395,7 @@ extract_tar_from_url() {
             [ -r "$cand" ] && ca="$cand" && break
         done
  
-        # 1) curl first (IPv4, retries, redirects)
+        # curl first (IPv4, retries, redirects)
         if command -v curl >/dev/null 2>&1; then
             if [ -n "$ca" ]; then
                 curl -4 -L --fail --retry 3 --retry-delay 2 --connect-timeout 10 \
@@ -405,7 +410,7 @@ extract_tar_from_url() {
             case "$rc" in 60|35|22) return 60 ;; esac   # TLS-ish / HTTP fail
         fi
  
-        # 2) aria2c (if available)
+        # aria2c (if available)
         if command -v aria2c >/dev/null 2>&1; then
             aria2c -x4 -s4 -m3 --connect-timeout=10 \
                    -o "$(basename "$part")" --dir="$(dirname "$part")" "$src"
@@ -414,7 +419,7 @@ extract_tar_from_url() {
             rm -f "$part" 2>/dev/null || true
         fi
  
-        # 3) wget: handle BusyBox vs GNU
+        # wget: handle BusyBox vs GNU
         if command -v wget >/dev/null 2>&1; then
             if is_busybox_wget; then
                 # BusyBox wget has: -O, -T, --no-check-certificate (no -4, no --tries)
@@ -447,7 +452,6 @@ extract_tar_from_url() {
         return 127
     }
     # ------------------------------------------------------------------------
- 
     if [ "$status" -eq 0 ]; then
         log_info "Already extracted. Skipping download."
         return 0
@@ -2272,64 +2276,6 @@ execute_capture_block() {
     done
 }
 
-# --- Ensure rootfs has minimum size (defaults to 2GiB) -----------------------
-# Usage: ensure_rootfs_min_size [min_gib]
-# - Checks / size (df -P /) in KiB. If < min, runs resize2fs on the rootfs device.
-# - Logs to $LOG_DIR/resize2fs.log if LOG_DIR is set, else /tmp/resize2fs.log.
-ensure_rootfs_min_size() {
-    min_gib="${1:-2}"
-    min_kb=$((min_gib*1024*1024))
- 
-    total_kb="$(df -P / 2>/dev/null | awk 'NR==2{print $2}')"
-    [ -n "$total_kb" ] || { log_warn "df check failed; skipping resize."; return 0; }
- 
-    if [ "$total_kb" -ge "$min_kb" ] 2>/dev/null; then
-        log_info "Rootfs size OK (>=${min_gib}GiB)."
-        return 0
-    fi
- 
-    # Pick root device: prefer by-partlabel/rootfs, else actual source of /
-    root_dev="/dev/disk/by-partlabel/rootfs"
-    if [ ! -e "$root_dev" ]; then
-        if command -v findmnt >/dev/null 2>&1; then
-            root_dev="$(findmnt -n -o SOURCE / 2>/dev/null | head -n1)"
-        else
-            root_dev="$(awk '$2=="/"{print $1; exit}' /proc/mounts 2>/dev/null)"
-        fi
-    fi
- 
-    if [ -z "$root_dev" ] || [ ! -e "$root_dev" ]; then
-        log_warn "Could not determine root device; skipping resize."
-        return 0
-    fi
- 
-    # Optional: only run on ext* filesystems (resize2fs)
-    if command -v blkid >/dev/null 2>&1; then
-        fstype="$(blkid -o value -s TYPE "$root_dev" 2>/dev/null | head -n1)"
-        case "$fstype" in
-            ext2|ext3|ext4) : ;;
-            *) log_warn "Rootfs type '$fstype' not ext*, skipping resize."; return 0 ;;
-        esac
-    fi
- 
-    log_dir="${LOG_DIR:-/tmp}"
-    mkdir -p "$log_dir" 2>/dev/null || true
-    if command -v resize2fs >/dev/null 2>&1; then
-        log_info "Rootfs <${min_gib}GiB ($(awk '{print int($1/1024)}' <<EOF
-$total_kb
-EOF
-) MiB). Resizing filesystem on $root_dev ..."
-        if resize2fs "$root_dev" >>"$log_dir/resize2fs.log" 2>&1; then
-            log_pass "resize2fs completed on $root_dev (see $log_dir/resize2fs.log)."
-        else
-            log_warn "resize2fs failed on $root_dev (see $log_dir/resize2fs.log)."
-        fi
-    else
-        log_warn "resize2fs not available; skipping resize."
-    fi
-    return 0
-}
-
 log_soc_info() {
     m=""; s=""; pv=""
     [ -r /sys/devices/soc0/machine ] && m="$(cat /sys/devices/soc0/machine 2>/dev/null)"
@@ -2495,7 +2441,7 @@ tryremountrw() {
 #   FASTRPC_AUTOREMOUNT=yes|no     (default: no)  allow remount rw if needed
 #   FASTRPC_AUTOREMOUNT_RO=yes|no  (default: yes) remount ro after linking
 ensure_usr_lib_dsp_symlinks() {
-  [ "${FASTRPC_DSP_AUTOLINK:-yes}" = "yes" ] || { log_info "DSP autolink disabled" return 0; }
+  [ "${FASTRPC_DSP_AUTOLINK:-yes}" = "yes" ] || { log_info "DSP autolink disabled"; return 0; }
  
   dsptgt="/usr/lib/dsp"
  
@@ -2602,7 +2548,12 @@ ensure_usr_lib_dsp_symlinks() {
   # Final visibility + sanity
   if find "$dsptgt" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null | grep -q .; then
     log_info "DSP autolink complete ($linked link(s))"
-    ls -l "$dsptgt" 2>/dev/null | sed 's/^/[INFO] /' || true
+    find "$dsptgt" \
+      -mindepth 1 \
+      -maxdepth 1 \
+      -printf '%M %u %g %6s %TY-%Tm-%Td %TH:%TM %p\n' 2>/dev/null \
+      | sed 's/^/[INFO] /' \
+      || true
   else
     log_warn "DSP autolink finished but $dsptgt is still empty, source may contain only nested content or FS is RO."
   fi
@@ -2611,4 +2562,297 @@ ensure_usr_lib_dsp_symlinks() {
   if [ -n "$remounted" ] && [ -n "$mountpt" ] && [ "${FASTRPC_AUTOREMOUNT_RO:-yes}" = "yes" ]; then
     mount -o remount,ro "$mountpt" 2>/dev/null || true
   fi
+}
+
+# --- Ensure rootfs has minimum size (defaults to 2GiB) -----------------------
+# Usage: ensure_rootfs_min_size [min_gib]
+# - Checks / size (df -P /) in KiB. If < min, runs resize2fs on the rootfs device.
+# - Logs to $LOG_DIR/resize2fs.log if LOG_DIR is set, else /tmp/resize2fs.log.
+ensure_rootfs_min_size() {
+    min_gib="${1:-2}"
+    min_kb=$((min_gib*1024*1024))
+
+    total_kb="$(df -P / 2>/dev/null | awk 'NR==2{print $2}')"
+    [ -n "$total_kb" ] || { log_warn "df check failed; skipping resize."; return 0; }
+
+    if [ "$total_kb" -ge "$min_kb" ] 2>/dev/null; then
+        log_info "Rootfs size OK (>=${min_gib}GiB)."
+        return 0
+    fi
+
+    # Pick root device: prefer by-partlabel/rootfs, else actual source of /
+    root_dev="/dev/disk/by-partlabel/rootfs"
+    if [ ! -e "$root_dev" ]; then
+        if command -v findmnt >/dev/null 2>&1; then
+            root_dev="$(findmnt -n -o SOURCE / 2>/dev/null | head -n1)"
+        else
+            root_dev="$(awk '$2=="/"{print $1; exit}' /proc/mounts 2>/dev/null)"
+        fi
+    fi
+
+    # Detect filesystem type robustly
+    fstype=""
+    if command -v blkid >/dev/null 2>&1; then
+        fstype="$(blkid -o value -s TYPE "$root_dev" 2>/dev/null | head -n1)"
+        case "$fstype" in
+            *TYPE=*)
+                fstype="$(printf '%s' "$fstype" | sed -n 's/.*TYPE="\([^"]*\)".*/\1/p')"
+                ;;
+        esac
+        if [ -z "$fstype" ] && command -v lsblk >/dev/null 2>&1; then
+            fstype="$(lsblk -no FSTYPE "$root_dev" 2>/dev/null | head -n1)"
+        fi
+        if [ -z "$fstype" ]; then
+            fstype="$(blkid "$root_dev" 2>/dev/null | sed -n 's/.*TYPE="\([^"]*\)".*/\1/p')"
+        fi
+        case "$fstype" in
+            ext2|ext3|ext4) : ;;
+            *)
+                log_warn "Rootfs type '${fstype:-unknown}' not ext*, skipping resize."
+                return 0
+                ;;
+        esac
+    fi
+
+    log_dir="${LOG_DIR:-/tmp}"
+    mkdir -p "$log_dir" 2>/dev/null || true
+
+    if command -v resize2fs >/dev/null 2>&1; then
+        mib="$(printf '%s\n' "$total_kb" | awk '{printf "%d",$1/1024}')"
+        log_info "Rootfs <${min_gib}GiB (${mib} MiB). Resizing filesystem on $root_dev ..."
+        if resize2fs "$root_dev" >>"$log_dir/resize2fs.log" 2>&1; then
+            log_pass "resize2fs completed on $root_dev (see $log_dir/resize2fs.log)."
+        else
+            log_warn "resize2fs failed on $root_dev (see $log_dir/resize2fs.log)."
+        fi
+    else
+        log_warn "resize2fs not available; skipping resize."
+    fi
+    return 0
+}
+# ---- Connectivity probe (0 OK, 2 IP/no-internet, 1 no IP) ----
+# Env overrides:
+#   NET_PROBE_ROUTE_IP=1.1.1.1
+#   NET_PING_HOST=8.8.8.8
+check_network_status_rc() {
+    net_probe_route_ip="${NET_PROBE_ROUTE_IP:-1.1.1.1}"
+    net_ping_host="${NET_PING_HOST:-8.8.8.8}"
+
+    if command -v ip >/dev/null 2>&1; then
+        net_ip_addr="$(ip -4 route get "$net_probe_route_ip" 2>/dev/null \
+            | awk 'NR==1{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')"
+        if [ -z "$net_ip_addr" ]; then
+            net_ip_addr="$(ip -o -4 addr show scope global up 2>/dev/null \
+                | awk 'NR==1{split($4,a,"/"); print a[1]}')"
+        fi
+    else
+        net_ip_addr=""
+    fi
+
+    if [ -n "$net_ip_addr" ]; then
+        if command -v ping >/dev/null 2>&1; then
+            if ping -c 1 -W 2 "$net_ping_host" >/dev/null 2>&1 \
+               || ping -c 1 -w 2 "$net_ping_host" >/dev/null 2>&1; then
+                unset net_probe_route_ip net_ping_host net_ip_addr
+                return 0
+            fi
+            unset net_probe_route_ip net_ping_host net_ip_addr
+            return 2
+        else
+            unset net_probe_route_ip net_ping_host net_ip_addr
+            return 2
+        fi
+    fi
+
+    unset net_probe_route_ip net_ping_host net_ip_addr
+    return 1
+}
+
+# ---- Interface snapshot (INFO log only) ----
+net_log_iface_snapshot() {
+    net_ifc="$1"
+    [ -n "$net_ifc" ] || { unset net_ifc; return 0; }
+
+    net_admin="DOWN"
+    net_oper="unknown"
+    net_carrier="0"
+    net_ip="none"
+
+    if command -v ip >/dev/null 2>&1 && ip -o link show "$net_ifc" >/dev/null 2>&1; then
+        if ip -o link show "$net_ifc" | awk -F'[<>]' '{print $2}' | grep -qw UP; then
+            net_admin="UP"
+        fi
+    fi
+    [ -r "/sys/class/net/$net_ifc/operstate" ] && net_oper="$(cat "/sys/class/net/$net_ifc/operstate" 2>/dev/null)"
+    [ -r "/sys/class/net/$net_ifc/carrier"   ] && net_carrier="$(cat "/sys/class/net/$net_ifc/carrier"   2>/dev/null)"
+
+    if command -v get_ip_address >/dev/null 2>&1; then
+        net_ip="$(get_ip_address "$net_ifc" 2>/dev/null)"
+        [ -n "$net_ip" ] || net_ip="none"
+    fi
+
+    log_info "[NET] ${net_ifc}: admin=${net_admin} oper=${net_oper} carrier=${net_carrier} ip=${net_ip}"
+
+    unset net_ifc net_admin net_oper net_carrier net_ip
+}
+
+# ---- Bring the system online if possible (0 OK, 2 IP/no-internet, 1 no IP) ----
+ensure_network_online() {
+    check_network_status_rc; net_rc=$?
+    if [ "$net_rc" -eq 0 ]; then
+        ensure_reasonable_clock || log_warn "Proceeding in limited-network mode."
+        unset net_rc
+        return 0
+    fi
+
+    if command -v systemctl >/dev/null 2>&1 && command -v check_systemd_services >/dev/null 2>&1; then
+        check_systemd_services NetworkManager systemd-networkd connman || true
+    fi
+
+    net_had_any_ip=0
+
+    # -------- Ethernet pass --------
+    net_ifaces=""
+    if command -v get_ethernet_interfaces >/dev/null 2>&1; then
+        net_ifaces="$(get_ethernet_interfaces 2>/dev/null)"
+    fi
+
+    for net_ifc in $net_ifaces; do
+        net_log_iface_snapshot "$net_ifc"
+
+        if command -v is_link_up >/dev/null 2>&1; then
+            if ! is_link_up "$net_ifc"; then
+                log_info "[NET] ${net_ifc}: link=down → skipping DHCP"
+                continue
+            fi
+        fi
+
+        log_info "[NET] ${net_ifc}: bringing up and requesting DHCP..."
+        if command -v bringup_interface >/dev/null 2>&1; then
+            bringup_interface "$net_ifc" 2 2 || true
+        fi
+
+        if command -v run_dhcp_client >/dev/null 2>&1; then
+            run_dhcp_client "$net_ifc" 10 >/dev/null 2>&1 || true
+        elif command -v try_dhcp_client_safe >/dev/null 2>&1; then
+            try_dhcp_client_safe "$net_ifc" 8 || true
+        fi
+
+        net_log_iface_snapshot "$net_ifc"
+
+        check_network_status_rc; net_rc=$?
+        case "$net_rc" in
+            0)
+                log_pass "[NET] ${net_ifc}: internet reachable"
+                ensure_reasonable_clock || log_warn "Proceeding in limited-network mode."
+                unset net_ifaces net_ifc net_rc net_had_any_ip
+                return 0
+                ;;
+            2)
+                log_warn "[NET] ${net_ifc}: IP assigned but internet not reachable"
+                net_had_any_ip=1
+                ;;
+            1)
+                log_info "[NET] ${net_ifc}: still no IP after DHCP attempt"
+                ;;
+        esac
+    done
+
+    # -------- Wi-Fi pass --------
+    net_wifi=""
+    if command -v get_wifi_interface >/dev/null 2>&1; then
+        net_wifi="$(get_wifi_interface 2>/dev/null || echo "")"
+    fi
+    if [ -n "$net_wifi" ]; then
+        net_log_iface_snapshot "$net_wifi"
+        log_info "[NET] ${net_wifi}: bringing up Wi-Fi..."
+
+        if command -v bringup_interface >/dev/null 2>&1; then
+            bringup_interface "$net_wifi" 2 2 || true
+        fi
+
+        net_creds=""
+        if command -v get_wifi_credentials >/dev/null 2>&1; then
+            net_creds="$(get_wifi_credentials "" "" 2>/dev/null || true)"
+        fi
+
+        if [ -n "$net_creds" ]; then
+            net_ssid="$(printf '%s\n' "$net_creds" | awk '{print $1}')"
+            net_pass="$(printf '%s\n' "$net_creds" | awk '{print $2}')"
+            log_info "[NET] ${net_wifi}: trying nmcli for SSID='${net_ssid}'"
+            if command -v wifi_connect_nmcli >/dev/null 2>&1; then
+                wifi_connect_nmcli "$net_wifi" "$net_ssid" "$net_pass" || true
+            fi
+
+            # If nmcli brought us up, do NOT fall back to wpa_supplicant
+            check_network_status_rc; net_rc=$?
+            if [ "$net_rc" -ne 0 ]; then
+                log_info "[NET] ${net_wifi}: falling back to wpa_supplicant + DHCP"
+                if command -v wifi_connect_wpa_supplicant >/dev/null 2>&1; then
+                    wifi_connect_wpa_supplicant "$net_wifi" "$net_ssid" "$net_pass" || true
+                fi
+                if command -v run_dhcp_client >/dev/null 2>&1; then
+                    run_dhcp_client "$net_wifi" 10 >/dev/null 2>&1 || true
+                fi
+            fi
+        else
+            log_info "[NET] ${net_wifi}: no credentials provided → DHCP only"
+            if command -v run_dhcp_client >/dev/null 2>&1; then
+                run_dhcp_client "$net_wifi" 10 >/dev/null 2>&1 || true
+            fi
+        fi
+
+        net_log_iface_snapshot "$net_wifi"
+        check_network_status_rc; net_rc=$?
+        case "$net_rc" in
+            0)
+                log_pass "[NET] ${net_wifi}: internet reachable"
+                ensure_reasonable_clock || log_warn "Proceeding in limited-network mode."
+                unset net_wifi net_ifaces net_ifc net_rc net_had_any_ip net_creds net_ssid net_pass
+                return 0
+                ;;
+            2)
+                log_warn "[NET] ${net_wifi}: IP assigned but internet not reachable"
+                net_had_any_ip=1
+                ;;
+            1)
+                log_info "[NET] ${net_wifi}: still no IP after connect/DHCP attempt"
+                ;;
+        esac
+    fi
+
+    # -------- DHCP/route/DNS fixup (udhcpc script) --------
+    net_script_path=""
+    if command -v ensure_udhcpc_script >/dev/null 2>&1; then
+        net_script_path="$(ensure_udhcpc_script 2>/dev/null || echo "")"
+    fi
+    if [ -n "$net_script_path" ]; then
+        log_info "[NET] udhcpc default.script present → refreshing leases"
+        for net_ifc in $net_ifaces $net_wifi; do
+            [ -n "$net_ifc" ] || continue
+            if command -v run_dhcp_client >/dev/null 2>&1; then
+                run_dhcp_client "$net_ifc" 8 >/dev/null 2>&1 || true
+            fi
+        done
+        check_network_status_rc; net_rc=$?
+        case "$net_rc" in
+            0)
+                log_pass "[NET] connectivity restored after udhcpc fixup"
+                ensure_reasonable_clock || log_warn "Proceeding in limited-network mode."
+                unset net_script_path net_ifaces net_wifi net_ifc net_rc net_had_any_ip
+                return 0
+                ;;
+            2)
+                log_warn "[NET] IP present but still no internet after udhcpc fixup"
+                net_had_any_ip=1
+                ;;
+        esac
+    fi
+
+    if [ "$net_had_any_ip" -eq 1 ] 2>/dev/null; then
+        unset net_script_path net_ifaces net_wifi net_ifc net_rc net_had_any_ip
+        return 2
+    fi
+    unset net_script_path net_ifaces net_wifi net_ifc net_rc net_had_any_ip
+    return 1
 }
