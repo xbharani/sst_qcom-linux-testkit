@@ -241,15 +241,31 @@ if [ -n "$VIDEO_APP" ] && [ -f "$VIDEO_APP" ] && [ ! -x "$VIDEO_APP" ]; then
     fi
 fi
 
-# Decide final app path: if --app given, require it; otherwise try default path, else PATH
+# ---- Default firmware path for Kodiak downstream if CLI not given ----
+if [ -z "${VIDEO_FW_DS:-}" ]; then
+    default_fw="/data/vendor/iris_test_app/firmware/vpu20_1v.mbn"
+    if [ -f "$default_fw" ]; then
+        VIDEO_FW_DS="$default_fw"
+        export VIDEO_FW_DS
+        log_info "Using default downstream firmware path: $VIDEO_FW_DS"
+    fi
+fi
+
+# Decide final app path: if --app given, require it; otherwise search PATH, /usr/bin, /data/vendor/iris_test_app
 final_app=""
 
 if [ -n "$VIDEO_APP" ] && [ -x "$VIDEO_APP" ]; then
     final_app="$VIDEO_APP"
 else
-    if [ "$VIDEO_APP" = "/usr/bin/iris_v4l2_test" ]; then
-        if command -v iris_v4l2_test >/dev/null 2>&1; then
-            final_app="$(command -v iris_v4l2_test)"
+    if command -v iris_v4l2_test >/dev/null 2>&1; then
+        final_app="$(command -v iris_v4l2_test)"
+    else
+        if [ -x "/usr/bin/iris_v4l2_test" ]; then
+            final_app="/usr/bin/iris_v4l2_test"
+        else
+            if [ -x "/data/vendor/iris_test_app/iris_v4l2_test" ]; then
+                final_app="/data/vendor/iris_test_app/iris_v4l2_test"
+            fi
         fi
     fi
 fi

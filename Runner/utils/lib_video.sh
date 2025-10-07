@@ -451,42 +451,41 @@ video_normalize_stack() {
 video_detect_platform() {
     model=""
     compat=""
-
+ 
     if [ -r /proc/device-tree/model ]; then
         model=$(tr -d '\000' </proc/device-tree/model 2>/dev/null)
     fi
-
+ 
     if [ -r /proc/device-tree/compatible ]; then
         compat=$(tr -d '\000' </proc/device-tree/compatible 2>/dev/null)
     fi
-
+ 
     s=$(printf '%s\n%s\n' "$model" "$compat" | tr '[:upper:]' '[:lower:]')
-
-    echo "$s" | grep -q "qcs9100" && {
+ 
+    # Monaco: qcs8300-ride, iq-8275-evk, qcs8275, generic qcs8300, or ride-sx+8300
+    monaco_pat='qcs8300-ride|iq-8275-evk|qcs8275|qcs8300|ride-sx.*8300|8300.*ride-sx'
+ 
+    # LeMans: qcs9100-ride, qcs9075, generic qcs9100, or ride-sx+9100
+    lemans_pat='qcs9100-ride|qcs9075|qcs9100|ride-sx.*9100|9100.*ride-sx'
+ 
+    # Kodiak: qcs6490, qcm6490, or rb3+6490
+    kodiak_pat='qcs6490|qcm6490|rb3.*6490|6490.*rb3'
+ 
+    if printf '%s' "$s" | grep -Eq "$lemans_pat"; then
         printf '%s\n' "lemans"
         return 0
-    }
-    echo "$s" | grep -q "qcs8300" && {
+    fi
+ 
+    if printf '%s' "$s" | grep -Eq "$monaco_pat"; then
         printf '%s\n' "monaco"
         return 0
-    }
-    echo "$s" | grep -q "qcs6490" && {
+    fi
+ 
+    if printf '%s' "$s" | grep -Eq "$kodiak_pat"; then
         printf '%s\n' "kodiak"
         return 0
-    }
-    echo "$s" | grep -q "ride-sx" && echo "$s" | grep -q "9100" && {
-        printf '%s\n' "lemans"
-        return 0
-    }
-    echo "$s" | grep -q "ride-sx" && echo "$s" | grep -q "8300" && {
-        printf '%s\n' "monaco"
-        return 0
-    }
-    echo "$s" | grep -q "rb3" && echo "$s" | grep -q "6490" && {
-        printf '%s\n' "kodiak"
-        return 0
-    }
-
+    fi
+ 
     printf '%s\n' "unknown"
 }
 
