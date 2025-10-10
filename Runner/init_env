@@ -29,8 +29,9 @@ if [ -z "$ROOT_DIR" ]; then
     fi
 fi
 
-if [ ! -d "$ROOT_DIR/utils" ] || [ ! -f "$ROOT_DIR/utils/functestlib.sh" ]; then
-echo "[ERROR] Could not detect testkit root (missing utils/ or functestlib.sh)" >&2
+# --- Validate and export key environment paths ---
+if [ -z "${ROOT_DIR:-}" ] || [ ! -d "$ROOT_DIR/utils" ] || [ ! -f "$ROOT_DIR/utils/functestlib.sh" ]; then
+    echo "[ERROR] Could not detect testkit root (missing utils/ or functestlib.sh)" >&2
     exit 1
 fi
 
@@ -38,3 +39,15 @@ export ROOT_DIR
 export TOOLS="$ROOT_DIR/utils"
 export __RUNNER_SUITES_DIR="$ROOT_DIR/suites"
 export __RUNNER_UTILS_BIN_DIR="$ROOT_DIR/common"
+
+# --- Ensure TOOLS is usable in all shells ---
+case ":$PATH:" in
+  *":$TOOLS:"*) : ;;
+  *) PATH="$TOOLS:$PATH"; export PATH ;;
+esac
+
+# --- Optional: pre-check for required tools (safe no-op for minimal builds) ---
+if [ -f "$TOOLS/functestlib.sh" ]; then
+    # shellcheck disable=SC1090,SC1091
+    . "$TOOLS/functestlib.sh" >/dev/null 2>&1 || true
+fi
