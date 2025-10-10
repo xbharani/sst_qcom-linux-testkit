@@ -38,6 +38,8 @@ fi
 . "$TOOLS/functestlib.sh"
 # shellcheck disable=SC1091
 . "$TOOLS/audio_common.sh"
+# shellcheck disable=SC1091
+. "$TOOLS/lib_video.sh"
 
 TESTNAME="AudioPlayback"
 RES_FILE="./${TESTNAME}.res"
