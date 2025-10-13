@@ -325,41 +325,48 @@ extract_tar_from_url() {
     mkdir -p "$outdir" 2>/dev/null || true
  
     case "$url" in
-        /*) tarfile="$url" ;;
-        file://*) tarfile="${url#file://}" ;;
-        *)  tarfile="$outdir/$(basename "$url")" ;;
+        /*)
+            tarfile="$url"
+            ;;
+        file://*)
+            tarfile="${url#file://}"
+            ;;
+        *)
+            tarfile="$outdir/$(basename "$url")"
+            ;;
     esac
     markfile="${tarfile}.extracted"
+    skip_sentinel="${outdir}/.asset_fetch_skipped"
  
-    # --- small helper: decide if this archive already looks extracted in $outdir
+    # If a previous run already marked "assets unavailable", honor it and SKIP.
+    if [ -f "$skip_sentinel" ]; then
+        log_info "Previous run marked assets unavailable on this system (${skip_sentinel}); skipping download."
+        return 2
+    fi
+ 
     tar_already_extracted() {
         tf="$1"
         od="$2"
- 
-        # Fast path: explicit marker from a previous successful extract.
-        [ -f "${tf}.extracted" ] && return 0
- 
-        # Fall back: sniff a few entries from the archive and see if they exist on disk.
-        # (No reliance on any one filename; majority-of-first-10 rule.)
-        # NOTE: we intentionally avoid pipes->subshell to keep counters reliable in POSIX sh.
+        if [ -f "${tf}.extracted" ]; then
+            return 0
+        fi
         tmp_list="${od}/.tar_ls.$$"
-        if tar -tf "$tf" 2>/dev/null | head -n 20 >"$tmp_list"; then
-            total=0; present=0
-            # shellcheck disable=SC2039
+        if tar -tf "$tf" 2>/dev/null | head -n 20 > "$tmp_list"; then
+            total=0
+            present=0
             while IFS= read -r ent; do
                 [ -z "$ent" ] && continue
                 total=$((total + 1))
-                # Normalize (strip trailing slash for directories)
                 ent="${ent%/}"
-                # Check both full relative path and basename (covers archives with nested roots)
                 if [ -e "$od/$ent" ] || [ -e "$od/$(basename "$ent")" ]; then
                     present=$((present + 1))
                 fi
             done < "$tmp_list"
             rm -f "$tmp_list" 2>/dev/null || true
- 
-            # If we have at least 3 hits or ≥50% of probed entries, assume it's already extracted.
-            if [ "$present" -ge 3 ] || { [ "$total" -gt 0 ] && [ $((present * 100 / total)) -ge 50 ]; }; then
+            if [ "$present" -ge 3 ]; then
+                return 0
+            fi
+            if [ "$total" -gt 0 ] && [ $((present * 100 / total)) -ge 50 ]; then
                 return 0
             fi
         fi
@@ -367,10 +374,9 @@ extract_tar_from_url() {
     }
  
     if command -v check_tar_file >/dev/null 2>&1; then
-        # Your site-specific validator (returns 0=extracted ok, 2=exists but not extracted, 1=missing/bad)
-        check_tar_file "$url"; status=$?
+        check_tar_file "$url"
+        status=$?
     else
-        # Fallback: if archive exists and looks extracted -> status=0; if exists not-extracted -> 2; else 1
         if [ -f "$tarfile" ]; then
             if tar_already_extracted "$tarfile" "$outdir"; then
                 status=0
@@ -382,20 +388,66 @@ extract_tar_from_url() {
         fi
     fi
  
-    ensure_reasonable_clock || { log_warn "Proceeding in limited-network mode."; limited_net=1; }
+    ensure_reasonable_clock || {
+        log_warn "Proceeding in limited-network mode."
+        limited_net=1
+    }
  
-    # ---- helpers ------------------------------------------------------------
-    is_busybox_wget() { command -v wget >/dev/null 2>&1 && wget --help 2>&1 | head -n1 | grep -qi busybox; }
+    is_busybox_wget() {
+        if command -v wget >/dev/null 2>&1; then
+            if wget --help 2>&1 | head -n 1 | grep -qi busybox; then
+                return 0
+            fi
+        fi
+        return 1
+    }
+ 
+    tls_capable_fetcher_available() {
+        scheme_https=0
+        case "$url" in
+            https://*)
+                scheme_https=1
+                ;;
+        esac
+        if [ "$scheme_https" -eq 0 ]; then
+            return 0
+        fi
+        if command -v curl >/dev/null 2>&1; then
+            if curl -V 2>/dev/null | grep -qiE 'ssl|tls'; then
+                return 0
+            fi
+        fi
+        if command -v aria2c >/dev/null 2>&1; then
+            return 0
+        fi
+        if command -v wget >/dev/null 2>&1; then
+            if ! is_busybox_wget; then
+                return 0
+            fi
+            if command -v openssl >/dev/null 2>&1; then
+                return 0
+            fi
+        fi
+        return 1
+    }
  
     try_download() {
-        src="$1"; dst="$2"
+        src="$1"
+        dst="$2"
         part="${dst}.part.$$"
         ca=""
-        for cand in /etc/ssl/certs/ca-certificates.crt /etc/ssl/cert.pem /system/etc/security/cacerts/ca-certificates.crt; do
-            [ -r "$cand" ] && ca="$cand" && break
+ 
+        for cand in \
+            /etc/ssl/certs/ca-certificates.crt \
+            /etc/ssl/cert.pem \
+            /system/etc/security/cacerts/ca-certificates.crt
+        do
+            if [ -r "$cand" ]; then
+                ca="$cand"
+                break
+            fi
         done
  
-        # curl first (IPv4, retries, redirects)
         if command -v curl >/dev/null 2>&1; then
             if [ -n "$ca" ]; then
                 curl -4 -L --fail --retry 3 --retry-delay 2 --connect-timeout 10 \
@@ -405,77 +457,143 @@ extract_tar_from_url() {
                      -o "$part" "$src"
             fi
             rc=$?
-            if [ $rc -eq 0 ]; then mv -f "$part" "$dst" 2>/dev/null || true; return 0; fi
+            if [ $rc -eq 0 ]; then
+                mv -f "$part" "$dst" 2>/dev/null || true
+                return 0
+            fi
             rm -f "$part" 2>/dev/null || true
-            case "$rc" in 60|35|22) return 60 ;; esac   # TLS-ish / HTTP fail
+            case "$rc" in
+                60|35|22)
+                    return 60
+                    ;;
+            esac
         fi
  
-        # aria2c (if available)
         if command -v aria2c >/dev/null 2>&1; then
             aria2c -x4 -s4 -m3 --connect-timeout=10 \
                    -o "$(basename "$part")" --dir="$(dirname "$part")" "$src"
             rc=$?
-            if [ $rc -eq 0 ]; then mv -f "$part" "$dst" 2>/dev/null || true; return 0; fi
+            if [ $rc -eq 0 ]; then
+                mv -f "$part" "$dst" 2>/dev/null || true
+                return 0
+            fi
             rm -f "$part" 2>/dev/null || true
         fi
  
-        # wget: handle BusyBox vs GNU
         if command -v wget >/dev/null 2>&1; then
             if is_busybox_wget; then
-                # BusyBox wget has: -O, -T, --no-check-certificate (no -4, no --tries)
-                wget -O "$part" -T 15 "$src"; rc=$?
+                wget -O "$part" -T 15 "$src"
+                rc=$?
                 if [ $rc -ne 0 ]; then
                     log_warn "BusyBox wget failed (rc=$rc); final attempt with --no-check-certificate."
-                    wget -O "$part" -T 15 --no-check-certificate "$src"; rc=$?
+                    wget -O "$part" -T 15 --no-check-certificate "$src"
+                    rc=$?
                 fi
-                if [ $rc -eq 0 ]; then mv -f "$part" "$dst" 2>/dev/null || true; return 0; fi
+                if [ $rc -eq 0 ]; then
+                    mv -f "$part" "$dst" 2>/dev/null || true
+                    return 0
+                fi
                 rm -f "$part" 2>/dev/null || true
                 return 60
             else
-                # GNU wget: can use IPv4 and tries
                 if [ -n "$ca" ]; then
-                    wget -4 --timeout=15 --tries=3 --ca-certificate="$ca" -O "$part" "$src"; rc=$?
+                    wget -4 --timeout=15 --tries=3 --ca-certificate="$ca" -O "$part" "$src"
+                    rc=$?
                 else
-                    wget -4 --timeout=15 --tries=3 -O "$part" "$src"; rc=$?
+                    wget -4 --timeout=15 --tries=3 -O "$part" "$src"
+                    rc=$?
                 fi
                 if [ $rc -ne 0 ]; then
                     log_warn "wget failed (rc=$rc); final attempt with --no-check-certificate."
-                    wget -4 --timeout=15 --tries=1 --no-check-certificate -O "$part" "$src"; rc=$?
+                    wget -4 --timeout=15 --tries=1 --no-check-certificate -O "$part" "$src"
+                    rc=$?
                 fi
-                if [ $rc -eq 0 ] ; then mv -f "$part" "$dst" 2>/dev/null || true; return 0; fi
+                if [ $rc -eq 0 ]; then
+                    mv -f "$part" "$dst" 2>/dev/null || true
+                    return 0
+                fi
                 rm -f "$part" 2>/dev/null || true
-                [ $rc -eq 5 ] && return 60
+                if [ $rc -eq 5 ]; then
+                    return 60
+                fi
                 return $rc
             fi
         fi
  
         return 127
     }
-    # ------------------------------------------------------------------------
+ 
     if [ "$status" -eq 0 ]; then
         log_info "Already extracted. Skipping download."
         return 0
-    elif [ "$status" -eq 2 ]; then
+    fi
+ 
+    if [ "$status" -eq 2 ]; then
         log_info "File exists and is valid, but not yet extracted. Proceeding to extract."
     else
         case "$url" in
             /*|file://*)
-                if [ ! -f "$tarfile" ]; then log_fail "Local tar file not found: $tarfile"; return 1; fi
+                if [ ! -f "$tarfile" ]; then
+                    log_fail "Local tar file not found: $tarfile"
+                    return 1
+                fi
                 ;;
             *)
-                if [ -n "$limited_net" ]; then
-                    log_warn "Limited network; cannot fetch media bundle. Will SKIP decode cases."
-                    return 2
+                if [ ! -f "$tarfile" ] || [ ! -s "$tarfile" ]; then
+                    prestage_dirs=""
+                    if [ -n "${ASSET_DIR:-}" ]; then prestage_dirs="$prestage_dirs $ASSET_DIR"; fi
+                    if [ -n "${VIDEO_ASSET_DIR:-}" ]; then prestage_dirs="$prestage_dirs $VIDEO_ASSET_DIR"; fi
+                    if [ -n "${AUDIO_ASSET_DIR:-}" ]; then prestage_dirs="$prestage_dirs $AUDIO_ASSET_DIR"; fi
+                    prestage_dirs="$prestage_dirs . $outdir ${ROOT_DIR:-} ${ROOT_DIR:-}/cache /var/Runner /var/Runner/cache"
+ 
+                    for d in $prestage_dirs; do
+                        if [ -d "$d" ] && [ -f "$d/$(basename "$tarfile")" ]; then
+                            log_info "Using pre-staged tarball: $d/$(basename "$tarfile")"
+                            cp -f "$d/$(basename "$tarfile")" "$tarfile" 2>/dev/null || true
+                            break
+                        fi
+                    done
+ 
+                    if [ ! -s "$tarfile" ]; then
+                        for top in /mnt /media; do
+                            if [ -d "$top" ]; then
+                                for d in "$top"/*; do
+                                    if [ -d "$d" ] && [ -f "$d/$(basename "$tarfile")" ]; then
+                                        log_info "Using pre-staged tarball: $d/$(basename "$tarfile")"
+                                        cp -f "$d/$(basename "$tarfile")" "$tarfile" 2>/dev/null || true
+                                        break 2
+                                    fi
+                                done
+                            fi
+                        done
+                    fi
                 fi
-                log_info "Downloading $url -> $tarfile"
-                if ! try_download "$url" "$tarfile"; then
-                    rc=$?
-                    if [ $rc -eq 60 ]; then
-                        log_warn "TLS/handshake problem while downloading (cert/clock/firewall). Treating as limited network."
+ 
+                if [ ! -s "$tarfile" ]; then
+                    if [ -n "$limited_net" ]; then
+                        log_warn "Limited network, cannot fetch media bundle. Marking SKIP for callers."
+                        : > "$skip_sentinel" 2>/dev/null || true
                         return 2
                     fi
-                    log_fail "Failed to download $(basename "$url")"
-                    return 1
+ 
+                    if ! tls_capable_fetcher_available; then
+                        log_warn "No TLS-capable downloader available on this minimal build, cannot fetch: $url"
+                        log_warn "Pre-stage $(basename "$url") locally or use a file:// URL."
+                        : > "$skip_sentinel" 2>/dev/null || true
+                        return 2
+                    fi
+ 
+                    log_info "Downloading $url -> $tarfile"
+                    if ! try_download "$url" "$tarfile"; then
+                        rc=$?
+                        if [ $rc -eq 60 ]; then
+                            log_warn "TLS/handshake problem while downloading (cert/clock/firewall or minimal wget). Marking SKIP."
+                            : > "$skip_sentinel" 2>/dev/null || true
+                            return 2
+                        fi
+                        log_fail "Failed to download $(basename "$url")"
+                        return 1
+                    fi
                 fi
                 ;;
         esac
@@ -483,14 +601,18 @@ extract_tar_from_url() {
  
     log_info "Extracting $(basename "$tarfile")..."
     if tar -xvf "$tarfile"; then
-        # If we got here, assume success; write marker for future quick skips.
         : > "$markfile" 2>/dev/null || true
+	# Clear the minimal/offline sentinel only if it exists (SC2015-safe)
+        if [ -f "$skip_sentinel" ]; then
+            rm -f "$skip_sentinel" 2>/dev/null || true
+        fi
  
-        # Best-effort sanity: verify at least one entry now exists.
-        first_entry=$(tar -tf "$tarfile" 2>/dev/null | head -n1 | sed 's#/$##')
-        if [ -n "$first_entry" ] && { [ -e "$first_entry" ] || [ -e "$outdir/$first_entry" ]; }; then
-            log_pass "Files extracted successfully ($(basename "$first_entry") present)."
-            return 0
+        first_entry="$(tar -tf "$tarfile" 2>/dev/null | head -n 1 | sed 's#/$##')"
+        if [ -n "$first_entry" ]; then
+            if [ -e "$first_entry" ] || [ -e "$outdir/$first_entry" ]; then
+                log_pass "Files extracted successfully ($(basename "$first_entry") present)."
+                return 0
+            fi
         fi
         log_warn "Extraction finished but couldn't verify entries. Assuming success."
         return 0
@@ -499,6 +621,7 @@ extract_tar_from_url() {
     log_fail "Failed to extract $(basename "$tarfile")"
     return 1
 }
+
 
 # Function to check if a tar file exists
 check_tar_file() {
