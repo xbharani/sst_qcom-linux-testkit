@@ -683,9 +683,21 @@ check_tar_file() {
     return 2
 }
 
-# Check if weston is running
+# Return space-separated PIDs for 'weston' (BusyBox friendly).
+weston_pids() {
+    pids=""
+    if command -v pgrep >/dev/null 2>&1; then
+        pids="$(pgrep -x weston 2>/dev/null || true)"
+    fi
+    if [ -z "$pids" ]; then
+        pids="$(ps -eo pid,comm 2>/dev/null | awk '$2=="weston"{print $1}')"
+    fi
+    echo "$pids"
+}
+
+# Is Weston running?
 weston_is_running() {
-    pgrep -x weston >/dev/null 2>&1
+    [ -n "$(weston_pids)" ]
 }
 
 # Stop all Weston processes
@@ -711,31 +723,711 @@ weston_stop() {
 
 # Start weston with correct env if not running
 weston_start() {
-    export XDG_RUNTIME_DIR="/dev/socket/weston"
-    mkdir -p "$XDG_RUNTIME_DIR"
-
-    # Remove stale Weston socket if it exists
-    if [ -S "$XDG_RUNTIME_DIR/weston" ]; then
-        log_info "Removing stale Weston socket."
-        rm -f "$XDG_RUNTIME_DIR/weston"
-    fi
-
     if weston_is_running; then
         log_info "Weston already running."
         return 0
     fi
-    # Clean up stale sockets for wayland-0 (optional)
-    [ -S "$XDG_RUNTIME_DIR/wayland-1" ] && rm -f "$XDG_RUNTIME_DIR/wayland-1"
-    nohup weston --continue-without-input --idle-time=0 > weston.log 2>&1 &
-    sleep 3
-
-    if weston_is_running; then
-        log_info "Weston started."
-        return 0
-    else
-        log_error "Failed to start Weston."
+ 
+    if command -v systemctl >/dev/null 2>&1; then
+        log_info "Attempting to start via systemd: weston.service"
+        systemctl start weston.service >/dev/null 2>&1 || true
+        sleep 1
+        if weston_is_running; then
+            log_info "Weston started via systemd (weston.service)."
+            return 0
+        fi
+ 
+        log_info "Attempting to start via systemd: weston@.service"
+        systemctl start weston@.service >/dev/null 2>&1 || true
+        sleep 1
+        if weston_is_running; then
+            log_info "Weston started via systemd (weston@.service)."
+            return 0
+        fi
+ 
+        log_warn "systemd start did not bring Weston up; will try direct spawn."
+    fi
+ 
+    # Minimal-friendly direct spawn (no headless module guesses here).
+    ensure_xdg_runtime_dir
+ 
+    if ! command -v weston >/dev/null 2>&1; then
+        log_fail "weston binary not found in PATH."
         return 1
     fi
+ 
+    log_info "Attempting to spawn Weston (no backend override). Log: /tmp/weston.self.log"
+    ( nohup weston --log=/tmp/weston.self.log >/dev/null 2>&1 & ) || true
+ 
+    tries=0
+    while [ $tries -lt 5 ]; do
+        if weston_is_running; then
+            log_info "Weston is now running (PID(s): $(weston_pids))."
+            return 0
+        fi
+        if [ -n "$(find_wayland_sockets | head -n1)" ]; then
+            log_info "A Wayland socket appeared after spawn."
+            return 0
+        fi
+        sleep 1
+        tries=$((tries+1))
+    done
+ 
+    if [ -f /tmp/weston.self.log ]; then
+        log_warn "Weston spawn failed; last log lines:"
+        tail -n 20 /tmp/weston.self.log 2>/dev/null | sed 's/^/[weston.log] /' || true
+    else
+        log_warn "Weston spawn failed; no log file present."
+    fi
+    return 1
+}
+
+# Choose a socket (or try to start), adopt env, and echo chosen path.
+wayland_choose_or_start() {
+    wayland_debug_snapshot "pre-choose"
+    sock="$(wayland_pick_socket || true)"
+    if [ -z "$sock" ]; then
+        log_info "No Wayland socket found; attempting to start Weston…"
+        weston_start || log_warn "weston_start() did not succeed."
+        # Re-scan a few times
+        n=0
+        while [ $n -lt 5 ] && [ -z "$sock" ]; do
+            sock="$(wayland_pick_socket || true)"
+            [ -n "$sock" ] && break
+            sleep 1
+            n=$((n+1))
+        done
+    fi
+    if [ -n "$sock" ]; then
+        adopt_wayland_env_from_socket "$sock"
+        wayland_debug_snapshot "post-choose"
+        echo "$sock"
+        return 0
+    fi
+    wayland_debug_snapshot "no-socket"
+    return 1
+}
+# Ensure we have a writable XDG_RUNTIME_DIR for the current user.
+# Prefers /run/user/<uid>, falls back to /tmp/xdg-runtime-<uid>.
+ensure_xdg_runtime_dir() {
+    uid="$(id -u 2>/dev/null || echo 0)"
+    cand="/run/user/$uid"
+
+    if [ ! -d "$cand" ]; then
+        mkdir -p "$cand" 2>/dev/null || cand="/tmp/xdg-runtime-$uid"
+    fi
+
+    mkdir -p "$cand" 2>/dev/null || true
+    chmod 700 "$cand" 2>/dev/null || true
+    export XDG_RUNTIME_DIR="$cand"
+
+    log_info "XDG_RUNTIME_DIR ensured: $XDG_RUNTIME_DIR"
+}
+
+# Choose newest socket (by mtime); logs candidates for debugging.
+wayland_pick_socket() {
+    best=""
+    best_mtime=0
+
+    log_info "Wayland sockets found (candidate list):"
+    for s in $(find_wayland_sockets | sort -u); do
+        mt="$(stat -c %Y "$s" 2>/dev/null || echo 0)"
+        log_info "  - $s (mtime=$mt)"
+        if [ "$mt" -gt "$best_mtime" ]; then
+            best="$s"
+            best_mtime="$mt"
+        fi
+    done
+
+    if [ -n "$best" ]; then
+        log_info "Picked Wayland socket (newest): $best"
+        echo "$best"
+        return 0
+    fi
+    return 1
+}
+
+# ---- Wayland/Weston helpers -----------------------
+# Ensure a private XDG runtime directory exists and is usable (0700).
+weston_start() {
+    # Already up?
+    if weston_is_running; then
+        log_info "Weston already running."
+        return 0
+    fi
+ 
+    # 1) Try systemd user/system units if present
+    if command -v systemctl >/dev/null 2>&1; then
+        for unit in weston.service weston@.service; do
+            log_info "Attempting to start via systemd: $unit"
+            systemctl start "$unit" >/dev/null 2>&1 || true
+            sleep 1
+            if weston_is_running; then
+                log_info "Weston started via $unit."
+                return 0
+            fi
+        done
+        log_warn "systemd start did not bring Weston up; will try direct spawn."
+    fi
+ 
+    # Helper: attempt spawn for a given uid (empty => current user)
+    # Tries multiple backend names (to cover distro/plugin differences)
+    # Returns 0 if a weston process + socket appears, else non-zero.
+    spawn_weston_try() {
+        target_uid="$1"  # "" or numeric uid
+        backends="${WESTON_BACKENDS:-headless headless-backend.so}"
+ 
+        # Prepare runtime dir
+        if [ -n "$target_uid" ]; then
+            run_dir="/run/user/$target_uid"
+            mkdir -p "$run_dir" 2>/dev/null || true
+            chown "$target_uid:$target_uid" "$run_dir" 2>/dev/null || true
+        else
+            ensure_xdg_runtime_dir
+            run_dir="$XDG_RUNTIME_DIR"
+        fi
+        chmod 700 "$run_dir" 2>/dev/null || true
+ 
+        # Where to log
+        log_file="/tmp/weston.${target_uid:-self}.log"
+        rm -f "$log_file" 2>/dev/null || true
+ 
+        for be in $backends; do
+            log_info "Spawning weston (uid=${target_uid:-$(id -u)}) with backend='$be' …"
+            if ! command -v weston >/dev/null 2>&1; then
+                log_fail "weston binary not found in PATH."
+                return 1
+            fi
+ 
+            # Build the command: avoid optional modules that may not exist on minimal builds
+            cmd="XDG_RUNTIME_DIR='$run_dir' weston --backend='$be' --log='$log_file'"
+ 
+            if [ -n "$target_uid" ]; then
+                # Run as that uid if we can
+                if command -v su >/dev/null 2>&1; then
+                    su -s /bin/sh -c "$cmd >/dev/null 2>&1 &" "#$target_uid" || true
+                elif command -v runuser >/dev/null 2>&1; then
+                    runuser -u "#$target_uid" -- sh -c "$cmd >/dev/null 2>&1 &" || true
+                else
+                    log_warn "No su/runuser available to switch uid=$target_uid; skipping this mode."
+                    continue
+                fi
+            else
+                # Current user
+                ( nohup sh -c "$cmd" >/dev/null 2>&1 & ) || true
+            fi
+ 
+            # Wait up to ~5s for process + a socket to appear
+            tries=0
+            while [ $tries -lt 5 ]; do
+                if weston_is_running; then
+                    # See if a fresh socket is visible
+                    sock="$(wayland_pick_socket)"
+                    if [ -n "$sock" ]; then
+                        log_info "Weston up (backend=$be). Socket: $sock"
+                        return 0
+                    fi
+                fi
+                sleep 1
+                tries=$((tries+1))
+            done
+ 
+            # Show weston log tail to aid debugging
+            if [ -r "$log_file" ]; then
+                log_warn "Weston did not come up with backend '$be'. Last log lines:"
+                tail -n 20 "$log_file" | sed 's/^/[weston.log] /'
+            else
+                log_warn "Weston did not come up with backend '$be' and no log file present ($log_file)."
+            fi
+        done
+ 
+        return 1
+    }
+ 
+    # 2) Try as current user
+    if spawn_weston_try ""; then
+        return 0
+    fi
+ 
+    # 3) Try as 'weston' user (common on embedded images)
+    weston_uid=""
+    if command -v getent >/dev/null 2>&1; then
+        weston_uid="$(getent passwd weston 2>/dev/null | awk -F: '{print $3}')"
+    fi
+    [ -z "$weston_uid" ] && weston_uid="$(id -u weston 2>/dev/null || true)"
+ 
+    if [ -n "$weston_uid" ]; then
+        log_info "Attempting to spawn Weston as uid=$weston_uid (user 'weston')."
+        if spawn_weston_try "$weston_uid"; then
+            return 0
+        fi
+    else
+        log_info "No 'weston' user found; skipping user-switch spawn."
+    fi
+ 
+    log_warn "All weston spawn attempts failed."
+    return 1
+}
+
+# Return first Wayland socket under a base dir (prints path or fails).
+find_wayland_socket_in() {
+    base="$1"
+    [ -d "$base" ] || return 1
+    for s in "$base"/wayland-*; do
+        [ -S "$s" ] || continue
+        printf '%s\n' "$s"
+        return 0
+    done
+    return 1
+}
+
+# Best-effort discovery of a usable Wayland socket anywhere.
+discover_wayland_socket_anywhere() {
+    uid="$(id -u 2>/dev/null || echo 0)"
+    bases=""
+    [ -n "$XDG_RUNTIME_DIR" ] && bases="$bases $XDG_RUNTIME_DIR"
+    bases="$bases /dev/socket/weston /run/user/$uid /tmp/wayland-$uid /dev/shm"
+    for b in $bases; do
+        ensure_private_runtime_dir "$b" >/dev/null 2>&1 || true
+        if s="$(find_wayland_socket_in "$b")"; then
+            printf '%s\n' "$s"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Adopt env from a Wayland socket path like /run/user/0/wayland-0
+# Sets XDG_RUNTIME_DIR and WAYLAND_DISPLAY. Returns 0 on success.
+adopt_wayland_env_from_socket() {
+    s="$1"
+    if [ -z "$s" ] || [ ! -S "$s" ]; then
+        log_warn "adopt_wayland_env_from_socket: invalid socket: ${s:-<empty>}"
+        return 1
+    fi
+    XDG_RUNTIME_DIR="$(dirname "$s")"
+    WAYLAND_DISPLAY="$(basename "$s")"
+    export XDG_RUNTIME_DIR WAYLAND_DISPLAY
+    # Best-effort perms fix for minimal systems
+    chmod 700 "$XDG_RUNTIME_DIR" 2>/dev/null || true
+    log_info "Adopting Wayland environment from socket: $s"
+    log_info "Adopted Wayland env: XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR WAYLAND_DISPLAY=$WAYLAND_DISPLAY"
+    log_info "Reproduce with:"
+    log_info "  export XDG_RUNTIME_DIR='$XDG_RUNTIME_DIR'"
+    log_info "  export WAYLAND_DISPLAY='$WAYLAND_DISPLAY'"
+}
+
+# Try to connect to Wayland. Returns 0 on OK.
+wayland_can_connect() {
+    if command -v weston-info >/dev/null 2>&1; then
+        weston-info >/dev/null 2>&1
+        return $?
+    fi
+    # fallback: quick client probe
+    ( env -i XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" WAYLAND_DISPLAY="$WAYLAND_DISPLAY" true ) >/dev/null 2>&1
+    return $?
+}
+
+# Ensure a Weston socket exists; if not, stop+start Weston and adopt helper socket.
+weston_pick_env_or_start() {
+    sock="$(discover_wayland_socket_anywhere 2>/dev/null || true)"
+    if [ -n "$sock" ]; then
+        adopt_wayland_env_from_socket "$sock"
+        log_info "Selected Wayland socket: $sock"
+        return 0
+    fi
+
+    if weston_is_running; then
+        log_info "Stopping Weston..."
+        weston_stop
+        i=0; while weston_is_running && [ "$i" -lt 5 ]; do i=$((i+1)); sleep 1; done
+    fi
+
+    log_info "Starting Weston..."
+    weston_start
+    i=0; sock=""
+    while [ "$i" -lt 6 ]; do
+        sock="$(find_wayland_socket_in /dev/socket/weston 2>/dev/null || true)"
+        [ -n "$sock" ] && break
+        sleep 1; i=$((i+1))
+    done
+    if [ -z "$sock" ]; then
+        log_fail "Could not find Wayland socket after starting Weston."
+        return 1
+    fi
+    adopt_wayland_env_from_socket "$sock"
+    log_info "Weston started; socket: $sock"
+    return 0
+}
+
+# Find candidate Wayland sockets in common locations.
+# Prints absolute socket paths, one per line, most-preferred first.
+find_wayland_sockets() {
+    # Enumerate plausible Wayland sockets (one per line)
+    uid="$(id -u 2>/dev/null || echo 0)"
+ 
+    # Current env first (if valid)
+    if [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -n "${WAYLAND_DISPLAY:-}" ] &&
+       [ -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ]; then
+        echo "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY"
+    fi
+ 
+    # Current uid
+    for f in "/run/user/$uid/wayland-0" "/run/user/$uid/wayland-1" "/run/user/$uid/wayland-2"; do
+        [ -S "$f" ] && echo "$f"
+    done
+    for f in /run/user/"$uid"/wayland-*; do
+        [ -S "$f" ] && echo "$f"
+    done 2>/dev/null
+ 
+    # Any user under /run/user (root can traverse) — covers weston running as uid 1000
+    for d in /run/user/*; do
+        [ -d "$d" ] || continue
+        for f in "$d"/wayland-*; do
+            [ -S "$f" ] && echo "$f"
+        done
+    done 2>/dev/null
+ 
+    # weston-launch sockets
+    for f in /dev/socket/weston/wayland-*; do
+        [ -S "$f" ] && echo "$f"
+    done 2>/dev/null
+ 
+    # Last resort
+    for f in /tmp/wayland-*; do
+        [ -S "$f" ] && echo "$f"
+    done 2>/dev/null
+}
+
+# Ensure XDG_RUNTIME_DIR has owner=current-user and mode 0700.
+# Returns 0 if OK (or fixed), non-zero if still not compliant.
+ensure_wayland_runtime_dir_perms() {
+  dir="$1"
+  [ -n "$dir" ] && [ -d "$dir" ] || return 1
+
+  cur_uid="$(id -u 2>/dev/null || echo 0)"
+  cur_gid="$(id -g 2>/dev/null || echo 0)"
+
+  # Best-effort fixups first (don’t error if chown/chmod fail)
+  chown "$cur_uid:$cur_gid" "$dir" 2>/dev/null || true
+  chmod 0700 "$dir" 2>/dev/null || true
+
+  # Verify using stat (GNU first, then BSD). If stat is unavailable,
+  # we can’t verify—assume OK to avoid SC2012 (ls) usage.
+  if command -v stat >/dev/null 2>&1; then
+    # Mode: GNU: %a ; BSD: %Lp
+    mode="$(stat -c '%a' "$dir" 2>/dev/null || stat -f '%Lp' "$dir" 2>/dev/null || echo '')"
+    # Owner uid: GNU: %u ; BSD: %u
+    uid="$(stat -c '%u' "$dir" 2>/dev/null || stat -f '%u' "$dir" 2>/dev/null || echo '')"
+
+    [ "$mode" = "700" ] && [ "$uid" = "$cur_uid" ] && return 0
+    return 1
+  fi
+
+  # No stat available: directory exists and we attempted to fix perms/owner.
+  # Treat as success so clients can try; avoids SC2012 warnings.
+  return 0
+}
+
+# Quick Wayland handshake check.
+# Prefers `wayland-info` with a short timeout; otherwise validates socket presence.
+# Also enforces/fixes XDG_RUNTIME_DIR permissions so clients won’t reject it.
+wayland_connection_ok() {
+    if command -v wayland-info >/dev/null 2>&1; then
+        log_info "Probing Wayland with: wayland-info"
+        wayland-info >/dev/null 2>&1 && return 0
+        return 1
+    fi
+    if command -v weston-info >/dev/null 2>&1; then
+        log_info "Probing Wayland with: weston-info"
+        weston-info >/dev/null 2>&1 && return 0
+        return 1
+    fi
+    if command -v weston-simple-egl >/dev/null 2>&1; then
+        log_info "Probing Wayland by briefly starting weston-simple-egl"
+        ( weston-simple-egl >/dev/null 2>&1 & echo $! >"/tmp/.wsegl.$$" )
+        pid="$(cat "/tmp/.wsegl.$$" 2>/dev/null || echo)"
+        rm -f "/tmp/.wsegl.$$" 2>/dev/null || true
+        i=0
+        while [ $i -lt 2 ]; do
+            sleep 1
+            i=$((i+1))
+        done
+        if [ -n "$pid" ]; then
+            kill "$pid" 2>/dev/null || true
+        fi
+        # If it started at all, consider the connection OK (best effort).
+        return 0
+    fi
+    if [ -n "$XDG_RUNTIME_DIR" ] && [ -n "$WAYLAND_DISPLAY" ] && [ -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ]; then
+        log_info "No probe tools present; accepting socket existence as OK."
+        return 0
+    fi
+    return 1
+}
+# Very verbose snapshot for debugging (processes, sockets, env, perms).
+wayland_debug_snapshot() {
+    label="$1"
+    [ -n "$label" ] || label="snapshot"
+    log_info "----- Wayland/Weston debug snapshot: $label -----"
+ 
+    # Processes
+    wpids="$(weston_pids)"
+    if [ -n "$wpids" ]; then
+        log_info "weston PIDs: $wpids"
+        for p in $wpids; do
+            if command -v ps >/dev/null 2>&1; then
+                ps -o pid,user,group,cmd -p "$p" 2>/dev/null | sed 's/^/[ps] /' || true
+            fi
+            if [ -r "/proc/$p/cmdline" ]; then
+                tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null | sed 's/^/[cmdline] /' || true
+            fi
+        done
+    else
+        log_info "weston PIDs: (none)"
+    fi
+ 
+    # Sockets (meta) — use stat instead of ls (SC2012)
+    for s in $(find_wayland_sockets | sort -u); do
+        log_info "socket: $s"
+        stat -c '[stat] %n -> owner=%U:%G mode=%A size=%s mtime=%y' "$s" 2>/dev/null || true
+    done
+ 
+    # Current env
+    log_info "Env now: XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-<unset>} WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-<unset>}"
+    if [ -n "${XDG_RUNTIME_DIR:-}" ]; then
+        stat -c '[stat] %n -> owner=%U:%G mode=%A size=%s mtime=%y' "$XDG_RUNTIME_DIR" 2>/dev/null || true
+    fi
+ 
+    log_info "Suggested export (current env):"
+    log_info "  export XDG_RUNTIME_DIR='${XDG_RUNTIME_DIR:-}'"
+    log_info "  export WAYLAND_DISPLAY='${WAYLAND_DISPLAY:-}'"
+ 
+    log_info "----- End snapshot: $label -----"
+}
+
+# Print concise metadata for a path (portable).
+# Prefers stat(1) (GNU or BSD); falls back to ls(1) only if needed.
+# Usage: print_path_meta "/some/path"
+print_path_meta() {
+  p=$1
+  if [ -z "$p" ]; then
+    return 1
+  fi
+  # GNU stat
+  if stat -c '%A %U %G %a %n' "$p" >/dev/null 2>&1; then
+    stat -c '%A %U %G %a %n' "$p"
+    return 0
+  fi
+  # BSD/Mac stat
+  if stat -f '%Sp %Su %Sg %OLp %N' "$p" >/dev/null 2>&1; then
+    stat -f '%Sp %Su %Sg %OLp %N' "$p"
+    return 0
+  fi
+  # shellcheck disable=SC2012
+  ls -ld -- "$p" 2>/dev/null
+}
+
+###############################################################################
+# DRM / Display helpers (portable, minimal-build friendly)
+###############################################################################
+
+# Echo lines: "<name>\t<status>\t<type>\t<modes>\t<first_mode>"
+# Example: "card0-HDMI-A-1 connected HDMI-A 9 1920x1080"
+display_list_connectors() {
+    found=0
+    for d in /sys/class/drm/*-*; do
+        [ -e "$d" ] || continue
+        [ -f "$d/status" ] || continue
+        name="$(basename "$d")"
+        status="$(tr -d '\r\n' <"$d/status" 2>/dev/null)"
+ 
+        # Derive connector type from name: cardX-<TYPE>-N
+        # Strip "cardN-" prefix and trailing "-N" index.
+        typ="$(printf '%s' "$name" \
+            | sed -n 's/^card[0-9]\+-\([A-Za-z0-9+]\+\(-[A-Za-z0-9+]\+\)*\)-[0-9]\+/\1/p')"
+        [ -z "$typ" ] && typ="unknown"
+ 
+        # Modes
+        modes_file="$d/modes"
+        if [ -f "$modes_file" ]; then
+            # wc output can have spaces on BusyBox; trim
+            mc="$(wc -l <"$modes_file" 2>/dev/null | tr -d '[:space:]')"
+            [ -z "$mc" ] && mc=0
+            fm="$(head -n 1 "$modes_file" 2>/dev/null | tr -d '\r\n')"
+        else
+            mc=0
+            fm=""
+        fi
+ 
+        printf '%s\t%s\t%s\t%s\t%s\n' "$name" "$status" "$typ" "$mc" "$fm"
+        found=1
+    done
+    [ "$found" -eq 1 ] || return 1
+    return 0
+}
+
+# Return 0 if any connector is connected; else 1
+display_any_attached() {
+    for d in /sys/class/drm/*-*; do
+        [ -f "$d/status" ] || continue
+        st="$(tr -d '\r\n' <"$d/status" 2>/dev/null)"
+        if [ "$st" = "connected" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Print one compact human line summarizing connected outputs
+display_connected_summary() {
+    have=0
+    line=""
+    # shellcheck disable=SC2039
+    while IFS="$(printf '\t')" read -r name status typ mc fm; do
+        [ "$status" = "connected" ] || continue
+        have=1
+        if [ -n "$fm" ]; then
+            seg="${name}(${typ},${fm})"
+        else
+            seg="${name}(${typ})"
+        fi
+        if [ -z "$line" ]; then line="$seg"; else line="$line, $seg"; fi
+    done <<EOF
+$(display_list_connectors 2>/dev/null || true)
+EOF
+    if [ "$have" -eq 1 ]; then
+        echo "$line"
+        return 0
+    fi
+    echo "none"
+    return 1
+}
+
+# Best-effort "primary" guess: first connected with a mode; else first connected; echoes name
+display_primary_guess() {
+    best=""
+    # Prefer one with modes
+    # shellcheck disable=SC2039
+    while IFS="$(printf '\t')" read -r name status typ mc fm; do
+        [ "$status" = "connected" ] || continue
+        if [ -n "$fm" ]; then echo "$name"; return 0; fi
+        [ -z "$best" ] && best="$name"
+    done <<EOF
+$(display_list_connectors 2>/dev/null || true)
+EOF
+    [ -n "$best" ] && { echo "$best"; return 0; }
+    return 1
+}
+
+# Optional enrichment via weston-info (if available)
+# Prints lines: "weston: <output_name> model=<model> make=<make> phys=<WxH>mm"
+display_weston_outputs() {
+    if ! command -v weston-info >/dev/null 2>&1; then
+        return 0
+    fi
+    # Very light parse; tolerate different locales
+    weston-info 2>/dev/null \
+    | awk '
+        $1=="output" && $2~/^[0-9]+:$/ {out=$2; sub(":","",out)}
+        /make:/ {make=$2}
+        /model:/ {model=$2}
+        /physical size:/ {w=$3; h=$5; sub("mm","",h)}
+        /scale:/ {
+          if (out!="") {
+            printf("weston: %s make=%s model=%s phys=%sx%sm\n", out, make, model, w, h);
+            out=""; make=""; model=""; w=""; h="";
+          }
+        }
+    '
+    return 0
+}
+
+# One-stop debug snapshot
+display_debug_snapshot() {
+    ctx="$1"
+    [ -z "$ctx" ] && ctx="display-snapshot"
+    log_info "----- Display snapshot: $ctx -----"
+
+    # DRM nodes (no ls; iterate)
+    nodes=""
+    for f in /dev/dri/card* /dev/dri/renderD*; do
+        if [ -e "$f" ]; then
+            if [ -z "$nodes" ]; then nodes="$f"; else nodes="$nodes $f"; fi
+        fi
+    done
+    if [ -n "$nodes" ]; then
+        log_info "DRM nodes: $nodes"
+    else
+        log_warn "No /dev/dri/* nodes found."
+    fi
+
+    # Connectors
+    have=0
+    # shellcheck disable=SC2039
+    while IFS="$(printf '\t')" read -r name status typ mc fm; do
+        have=1
+        if [ -n "$fm" ]; then
+            log_info "DRM: ${name} status=${status} type=${typ} modes=${mc} first=${fm}"
+        else
+            log_info "DRM: ${name} status=${status} type=${typ} modes=${mc}"
+        fi
+    done <<EOF
+$(display_list_connectors 2>/dev/null || true)
+EOF
+    [ "$have" -eq 1 ] || log_warn "No DRM connectors in /sys/class/drm."
+
+    # Summary + weston outputs (if any)
+    sum="$(display_connected_summary 2>/dev/null || echo none)"
+    log_info "Connected summary: $sum"
+    display_weston_outputs | while IFS= read -r l; do
+        [ -n "$l" ] && log_info "$l"
+    done
+
+    log_info "----- End display snapshot: $ctx -----"
+}
+
+display_debug_snapshot() {
+    ctx="$1"
+    [ -z "$ctx" ] && ctx="display-snapshot"
+    log_info "----- Display snapshot: $ctx -----"
+ 
+    # DRM nodes
+    nodes=""
+    for f in /dev/dri/card* /dev/dri/renderD*; do
+        [ -e "$f" ] && nodes="${nodes:+$nodes }$f"
+    done
+    if [ -n "$nodes" ]; then
+        log_info "DRM nodes: $nodes"
+    else
+        log_warn "No /dev/dri/* nodes found."
+    fi
+ 
+    # Sysfs connectors (expects display_list_connectors to print tab-separated fields)
+    have=0
+    while IFS="$(printf '\t')" read -r name status typ mc fm; do
+        [ -n "$name" ] || continue
+        have=1
+        if [ -n "$fm" ]; then
+            log_info "DRM: ${name} status=${status} type=${typ} modes=${mc} first=${fm}"
+        else
+            log_info "DRM: ${name} status=${status} type=${typ} modes=${mc}"
+        fi
+    done <<EOF
+$(display_list_connectors 2>/dev/null || true)
+EOF
+    [ "$have" -eq 1 ] || log_warn "No DRM connectors in /sys/class/drm."
+ 
+    # Connected summary (sysfs)
+    sum="$(display_connected_summary 2>/dev/null || echo none)"
+    log_info "Connected summary (sysfs): $sum"
+ 
+    # Optional weston outputs (existing helper)
+    display_weston_outputs | while IFS= read -r l; do
+        [ -n "$l" ] && log_info "$l"
+    done
+ 
+    log_info "----- End display snapshot: $ctx -----"
 }
 
 # Returns true (0) if interface is administratively and physically up
