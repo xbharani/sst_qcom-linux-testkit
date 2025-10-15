@@ -3033,75 +3033,205 @@ $val" ;;
 }
 
 # Applies media configuration (format and links) using media-ctl from parsed pipeline block.
-# Resets media graph first and applies user-specified format override if needed.
+# Mirrors manual flow:
+#  - Global reset (prefer 'reset', fallback to -r)
+#  - Pads use MBUS code (never '*P'); if USER_FORMAT ends with P, strip P for pads
+#  - Strip any 'field:*' tokens from -V lines
+#  - Apply ONLY these 2 links:
+#      csiphy*:1 -> csid*:0
+#      csid*:1   -> *rdi*:0
+#  - Small settle before capture
 configure_pipeline_block() {
-    MEDIA_NODE="$1" USER_FORMAT="$2"
-
-    media-ctl -d "$MEDIA_NODE" --reset >/dev/null 2>&1
-
-    # Apply MEDIA_CTL_V (override format if USER_FORMAT set)
+    MEDIA_NODE="$1"
+    USER_FORMAT="$2"
+ 
+    # Reset graph
+    if ! media-ctl -d "$MEDIA_NODE" reset >/dev/null 2>&1; then
+        media-ctl -d "$MEDIA_NODE" -r >/dev/null 2>&1 || true
+    fi
+ 
+    # Apply pad formats (MBUS, never *P). Also strip 'field:*'.
     printf "%s\n" "$MEDIA_CTL_V_LIST" | while IFS= read -r vline || [ -n "$vline" ]; do
         [ -z "$vline" ] && continue
-        vline_new="$vline"
+ 
+        curfmt="$(printf "%s" "$vline" | sed -n 's/.*fmt:\([^/]*\)\/.*/\1/p')"
+        newfmt="$curfmt"
+ 
         if [ -n "$USER_FORMAT" ]; then
-            vline_new=$(printf "%s" "$vline_new" | sed -E "s/fmt:[^/]+\/([0-9]+x[0-9]+)/fmt:${USER_FORMAT}\/\1/g")
+            case "$USER_FORMAT" in
+                *P) newfmt="${USER_FORMAT%P}" ;;
+                 *) newfmt="$USER_FORMAT" ;;
+            esac
+        else
+            case "$curfmt" in
+                *P) newfmt="${curfmt%P}" ;;
+                 *) newfmt="$curfmt" ;;
+            esac
         fi
+ 
+        vline_new="$(printf "%s" "$vline" | sed -E "s/fmt:[^/]+/fmt:${newfmt}/")"
+        vline_new="$(printf "%s" "$vline_new" | sed -E 's/ field:[^]]*//g')"
+ 
+        if [ -n "$YAVTA_W" ] && [ -n "$YAVTA_H" ]; then
+            vline_new="$(printf "%s" "$vline_new" \
+                | sed -E "s/(fmt:[^/]+\/)[0-9]+x[0-9]+/\1${YAVTA_W}x${YAVTA_H}/")"
+        fi
+ 
         media-ctl -d "$MEDIA_NODE" -V "$vline_new" >/dev/null 2>&1
     done
-
-    # Apply MEDIA_CTL_L
+ 
+    # Apply ONLY the two links (no fragile case patterns; avoids ShellCheck parse issues).
     printf "%s\n" "$MEDIA_CTL_L_LIST" | while IFS= read -r lline || [ -n "$lline" ]; do
         [ -z "$lline" ] && continue
-        media-ctl -d "$MEDIA_NODE" -l "$lline" >/dev/null 2>&1
-    done
-}
-
-# Executes yavta pipeline controls and captures frames from a video node.
-# Handles pre-capture and post-capture register writes, with detailed result code
-execute_capture_block() {
-    FRAMES="$1" FORMAT="$2"
-
-    # Pre-stream controls
-    printf "%s\n" "$YAVTA_CTRL_PRE_LIST" | while IFS= read -r ctrl; do
-        [ -z "$ctrl" ] && continue
-        dev=$(echo "$ctrl" | awk '{print $1}')
-        reg=$(echo "$ctrl" | awk '{print $2}')
-        val=$(echo "$ctrl" | awk '{print $3}')
-        yavta --no-query -w "$reg $val" "$dev" >/dev/null 2>&1
-    done
-
-    # Stream-on controls
-    printf "%s\n" "$YAVTA_CTRL_LIST" | while IFS= read -r ctrl; do
-        [ -z "$ctrl" ] && continue
-        dev=$(echo "$ctrl" | awk '{print $1}')
-        reg=$(echo "$ctrl" | awk '{print $2}')
-        val=$(echo "$ctrl" | awk '{print $3}')
-        yavta --no-query -w "$reg $val" "$dev" >/dev/null 2>&1
-    done
-
-    # Capture
-    if [ -n "$YAVTA_DEV" ] && [ -n "$FORMAT" ] && [ -n "$YAVTA_W" ] && [ -n "$YAVTA_H" ]; then
-        OUT=$(yavta -B capture-mplane -c -I -n "$FRAMES" -f "$FORMAT" -s "${YAVTA_W}x${YAVTA_H}" -F "$YAVTA_DEV" --capture="$FRAMES" --file="frame-#.bin" 2>&1)
-        RET=$?
-        if echo "$OUT" | grep -qi "Unsupported video format"; then
-            return 2
-        elif [ $RET -eq 0 ] && echo "$OUT" | grep -q "Captured [1-9][0-9]* frames"; then
-            return 0
+        sline="$(printf "%s" "$lline" | tr -d '"')"
+        if [ "${sline#*csiphy*:1->*csid*:0*}" != "$sline" ]; then
+            media-ctl -d "$MEDIA_NODE" -l "$lline" >/dev/null 2>&1
+        elif [ "${sline#*csid*:1->*rdi*:0*}" != "$sline" ]; then
+            media-ctl -d "$MEDIA_NODE" -l "$lline" >/dev/null 2>&1
         else
-            return 1
+            : # ignore others
         fi
+    done
+ 
+    sleep 0.15
+}
+ 
+# Executes yavta capture with the same semantics as your manual call.
+# Return codes:
+#   0: PASS (>=1 frame captured)
+#   1: FAIL (capture error)
+#   2: SKIP (unsupported format)
+#   3: SKIP (missing data)
+execute_capture_block() {
+    FRAMES="$1"
+    FORMAT="$2"
+
+    [ -z "$YAVTA_DEV" ] && return 3
+    [ -z "$FORMAT" ] && return 3
+    [ -z "$YAVTA_W" ] && return 3
+    [ -z "$YAVTA_H" ] && return 3
+
+    # Build args as separate, quoted tokens (fixes SC2086 safely)
+    SFLAG="-s"
+    SRES="${YAVTA_W}x${YAVTA_H}"
+
+    CAPS="$(v4l2-ctl -D -d "$YAVTA_DEV" 2>/dev/null || true)"
+    BFLAG="-B"
+    if printf '%s\n' "$CAPS" | grep -qi 'MPlane'; then
+        BMODE="capture-mplane"
     else
-        return 3
+        BMODE="capture"
     fi
 
-    # Post-stream controls
-    printf "%s\n" "$YAVTA_CTRL_POST_LIST" | while IFS= read -r ctrl; do
-        [ -z "$ctrl" ] && continue
-        dev=$(echo "$ctrl" | awk '{print $1}')
-        reg=$(echo "$ctrl" | awk '{print $2}')
-        val=$(echo "$ctrl" | awk '{print $3}')
-        yavta --no-query -w "$reg $val" "$dev" >/dev/null 2>&1
-    done
+    sleep 0.12
+
+    do_capture_once() {
+        # $1 = mode (capture|capture-mplane)
+        yavta "$BFLAG" "$1" -c -I -n "$FRAMES" -f "$FORMAT" "$SFLAG" "$SRES" \
+              -F "$YAVTA_DEV" --capture="$FRAMES" --file='frame-#.bin' 2>&1
+        return $?
+    }
+
+    OUT="$(do_capture_once "$BMODE")"; RET=$?
+    if [ $RET -eq 0 ] && echo "$OUT" | grep -q "Captured [1-9][0-9]* frames"; then
+        return 0
+    fi
+    echo "$OUT" | grep -qi "Unsupported video format" && return 2
+
+    sleep 0.10
+    OUT="$(do_capture_once "$BMODE")"; RET=$?
+    if [ $RET -eq 0 ] && echo "$OUT" | grep -q "Captured [1-9][0-9]* frames"; then
+        return 0
+    fi
+    echo "$OUT" | grep -qi "Unsupported video format" && return 2
+
+    # Plane flip
+    case "$BMODE" in
+        capture) FLIPMODE="capture-mplane" ;;
+        *)       FLIPMODE="capture" ;;
+    esac
+    OUT="$(do_capture_once "$FLIPMODE")"; RET=$?
+    if [ $RET -eq 0 ] && echo "$OUT" | grep -q "Captured [1-9][0-9]* frames"; then
+        return 0
+    fi
+    echo "$OUT" | grep -qi "Unsupported video format" && return 2
+
+    # Try P<->non-P sibling of FORMAT
+    case "$FORMAT" in *P) ALT="${FORMAT%P}" ;; *) ALT="${FORMAT}P" ;; esac
+    FORMAT="$ALT"
+    OUT="$(do_capture_once "$BMODE")"; RET=$?
+    if [ $RET -eq 0 ] && echo "$OUT" | grep -q "Captured [1-9][0-9]* frames"; then
+        return 0
+    fi
+    echo "$OUT" | grep -qi "Unsupported video format" && return 2
+
+    OUT="$(do_capture_once "$FLIPMODE")"; RET=$?
+    if [ $RET -eq 0 ] && echo "$OUT" | grep -q "Captured [1-9][0-9]* frames"; then
+        return 0
+    fi
+    echo "$OUT" | grep -qi "Unsupported video format" && return 2
+
+    return 1
+}
+
+print_planned_commands() {
+    media_node="$1"
+    pixfmt="$2"
+ 
+    # Pads should use MBUS code (strip trailing 'P' if present)
+    padfmt="$(printf '%s' "$pixfmt" | sed 's/P$//')"
+ 
+    log_info "[CI] Planned sequence:"
+    log_info " media-ctl -d $media_node --reset"
+ 
+    # Pad formats: show MBUS (non-P) on -V lines
+    if [ -n "$MEDIA_CTL_V_LIST" ]; then
+        printf '%s\n' "$MEDIA_CTL_V_LIST" | while IFS= read -r vline; do
+            [ -z "$vline" ] && continue
+            vline_out="$(printf '%s' "$vline" | sed -E "s/fmt:[^/]+\/([0-9]+x[0-9]+)/fmt:${padfmt}\/\1/g")"
+            log_info " media-ctl -d $media_node -V '$vline_out'"
+        done
+    fi
+ 
+    # Links unchanged
+    if [ -n "$MEDIA_CTL_L_LIST" ]; then
+        printf '%s\n' "$MEDIA_CTL_L_LIST" | while IFS= read -r lline; do
+            [ -z "$lline" ] && continue
+            log_info " media-ctl -d $media_node -l '$lline'"
+        done
+    fi
+ 
+    # Any pre/post yavta register writes (unchanged)
+    if [ -n "$YAVTA_CTRL_PRE_LIST" ]; then
+        printf '%s\n' "$YAVTA_CTRL_PRE_LIST" | while IFS= read -r ctrl; do
+            [ -z "$ctrl" ] && continue
+            dev="$(printf '%s' "$ctrl" | awk '{print $1}')"
+            reg="$(printf '%s' "$ctrl" | awk '{print $2}')"
+            val="$(printf '%s' "$ctrl" | awk '{print $3}')"
+            [ -n "$dev" ] && [ -n "$reg" ] && [ -n "$val" ] && \
+              log_info " yavta --no-query -w '$reg $val' $dev"
+        done
+    fi
+ 
+    size_arg=""
+    if [ -n "$YAVTA_W" ] && [ -n "$YAVTA_H" ]; then
+        size_arg="-s ${YAVTA_W}x${YAVTA_H}"
+    fi
+    if [ -n "$YAVTA_DEV" ]; then
+        # Show pixel format (SRGGB10P) only on the video node
+        log_info " yavta -B capture-mplane -c -I -n $FRAMES -f $pixfmt $size_arg -F $YAVTA_DEV --capture=$FRAMES --file='frame-#.bin'"
+    fi
+ 
+    if [ -n "$YAVTA_CTRL_POST_LIST" ]; then
+        printf '%s\n' "$YAVTA_CTRL_POST_LIST" | while IFS= read -r ctrl; do
+            [ -z "$ctrl" ] && continue
+            dev="$(printf '%s' "$ctrl" | awk '{print $1}')"
+            reg="$(printf '%s' "$ctrl" | awk '{print $2}')"
+            val="$(printf '%s' "$ctrl" | awk '{print $3}')"
+            [ -n "$dev" ] && [ -n "$reg" ] && [ -n "$val" ] && \
+              log_info " yavta --no-query -w '$reg $val' $dev"
+        done
+    fi
 }
 
 log_soc_info() {
