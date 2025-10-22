@@ -140,6 +140,9 @@ log_info "Args: backend=${AUDIO_BACKEND:-auto} source=$SRC_CHOICE loops=$LOOPS d
 if [ -z "$AUDIO_BACKEND" ]; then
   AUDIO_BACKEND="$(detect_audio_backend)"
 fi
+BACKENDS_TO_TRY="$(build_backend_chain)"
+# Use it for visibility and to satisfy shellcheck usage
+log_info "Backend fallback chain: $BACKENDS_TO_TRY"
 if [ -z "$AUDIO_BACKEND" ]; then
   log_skip "$TESTNAME SKIP - no audio backend running"
   echo "$TESTNAME SKIP" > "$RES_FILE"
@@ -185,31 +188,126 @@ case "$AUDIO_BACKEND:$SRC_CHOICE" in
     ;;
 esac
 
-if [ -z "$SRC_ID" ]; then
-  log_skip "$TESTNAME SKIP - requested source '$SRC_CHOICE' not found for $AUDIO_BACKEND"
+# ---- Dynamic fallback when mic is missing on the chosen backend ----
+# Stay on PipeWire even if SRC_ID is empty; pw-record and arecord -D pipewire can use the default source.
+if [ -z "$SRC_ID" ] && [ "$SRC_CHOICE" = "mic" ] && [ "$AUDIO_BACKEND" != "pipewire" ]; then
+  for b in $BACKENDS_TO_TRY; do
+    [ "$b" = "$AUDIO_BACKEND" ] && continue
+    case "$b" in
+      pipewire)
+        cand="$(pw_default_mic)"
+        if [ -n "$cand" ]; then
+          AUDIO_BACKEND="pipewire"; SRC_ID="$cand"
+          log_info "Falling back to backend: pipewire (source id=$SRC_ID)"
+          break
+        fi
+        ;;
+      pulseaudio)
+        cand="$(pa_default_mic)"
+        if [ -n "$cand" ]; then
+          AUDIO_BACKEND="pulseaudio"; SRC_ID="$cand"
+          log_info "Falling back to backend: pulseaudio (source=$SRC_ID)"
+          break
+        fi
+        ;;
+      alsa)
+        cand="$(alsa_pick_capture)"
+        if [ -n "$cand" ]; then
+          AUDIO_BACKEND="alsa"; SRC_ID="$cand"
+          log_info "Falling back to backend: alsa (device=$SRC_ID)"
+          break
+        fi
+        ;;
+    esac
+  done
+fi
+
+# Only skip if no source AND not on PipeWire.
+if [ -z "$SRC_ID" ] && [ "$AUDIO_BACKEND" != "pipewire" ]; then
+  log_skip "$TESTNAME SKIP - requested source '$SRC_CHOICE' not available on any backend ($BACKENDS_TO_TRY)"
   echo "$TESTNAME SKIP" > "$RES_FILE"
   exit 2
 fi
 
+# ---- Normalize ALSA device id (fix "hw:0 1," → "hw:0,1") ----
+if [ "$AUDIO_BACKEND" = "alsa" ]; then
+  case "$SRC_ID" in
+    hw:*" "*,)
+      SRC_ID=$(printf '%s' "$SRC_ID" | sed -E 's/^hw:([0-9]+) ([0-9]+),$/hw:\1,\2/')
+      ;;
+    hw:*" "*)
+      SRC_ID=$(printf '%s' "$SRC_ID" | sed -E 's/^hw:([0-9]+) ([0-9]+)$/hw:\1,\2/')
+      ;;
+  esac
+fi
+
+# ---- Validate/auto-pick ALSA device if invalid (prevents "hw:,") ----
+if [ "$AUDIO_BACKEND" = "alsa" ]; then
+  case "$SRC_ID" in
+    hw:[0-9]*,[0-9]*|plughw:[0-9]*,[0-9]*)
+      : ;;
+    *)
+      cand="$(arecord -l 2>/dev/null | sed -n 's/^card[[:space:]]*\([0-9][0-9]*\).*device[[:space:]]*\([0-9][0-9]*\).*/hw:\1,\2/p' | head -n 1)"
+      if [ -z "$cand" ]; then
+        cand="$(sed -n 's/^\([0-9][0-9]*\)-\([0-9][0-9]*\):.*capture.*/hw:\1,\2/p' /proc/asound/pcm 2>/dev/null | head -n 1)"
+      fi
+      if [ -z "$cand" ]; then
+        cand="$(sed -n 's/.*\[\s*\([0-9][0-9]*\)-\s*\([0-9][0-9]*\)\]:.*capture.*/hw:\1,\2/p' /proc/asound/devices 2>/dev/null | head -n 1)"
+      fi
+      if printf '%s\n' "$cand" | grep -Eq '^hw:[0-9]+,[0-9]+$'; then
+        SRC_ID="$cand"
+        log_info "ALSA auto-pick: using $SRC_ID"
+      else
+        log_skip "$TESTNAME SKIP - no valid ALSA capture device found"
+        echo "$TESTNAME SKIP" > "$RES_FILE"
+        exit 2
+      fi
+      ;;
+  esac
+fi
+
+# ---- Routing log / defaults per backend ----
 if [ "$AUDIO_BACKEND" = "pipewire" ]; then
-  SRC_LABEL="$(pw_source_label_safe "$SRC_ID")"
-  wpctl set-default "$SRC_ID" >/dev/null 2>&1 || true
-  if [ -z "$SRC_LABEL" ]; then
-    SRC_LABEL="unknown"
+  if [ -n "$SRC_ID" ]; then
+    SRC_LABEL="$(pw_source_label_safe "$SRC_ID")"
+    wpctl set-default "$SRC_ID" >/dev/null 2>&1 || true
+    [ -z "$SRC_LABEL" ] && SRC_LABEL="unknown"
+    log_info "Routing to source: id/name=$SRC_ID label='$SRC_LABEL' choice=$SRC_CHOICE"
+  else
+    SRC_LABEL="default"
+    log_info "Routing to source: id/name=default label='default' choice=$SRC_CHOICE"
   fi
-  log_info "Routing to source: id/name=$SRC_ID label='$SRC_LABEL' choice=$SRC_CHOICE"
-else
+elif [ "$AUDIO_BACKEND" = "pulseaudio" ]; then
   SRC_LABEL="$(pa_source_name "$SRC_ID" 2>/dev/null || echo "$SRC_ID")"
   pa_set_default_source "$SRC_ID" >/dev/null 2>&1 || true
   log_info "Routing to source: name='$SRC_LABEL' choice=$SRC_CHOICE"
+else # ALSA
+  SRC_LABEL="$SRC_ID"
+  log_info "Routing to source: name='$SRC_LABEL' choice=$SRC_CHOICE"
 fi
+
+# If fallback changed backend, ensure deps are present (non-fatal → SKIP)
+case "$AUDIO_BACKEND" in
+  pipewire)
+    if ! check_dependencies wpctl pw-record; then
+      log_skip "$TESTNAME SKIP - missing PipeWire utils"
+      echo "$TESTNAME SKIP" > "$RES_FILE"; exit 2
+    fi ;;
+  pulseaudio)
+    if ! check_dependencies pactl parecord; then
+      log_skip "$TESTNAME SKIP - missing PulseAudio utils"
+      echo "$TESTNAME SKIP" > "$RES_FILE"; exit 2
+    fi ;;
+  alsa)
+    if ! check_dependencies arecord; then
+      log_skip "$TESTNAME SKIP - missing arecord"
+      echo "$TESTNAME SKIP" > "$RES_FILE"; exit 2
+    fi ;;
+esac
 
 # Watchdog info
 dur_s="$(duration_to_secs "$TIMEOUT" 2>/dev/null || echo 0)"
-if [ -z "$dur_s" ]; then
-  dur_s=0
-fi
-
+[ -z "$dur_s" ] && dur_s=0
 if [ "$dur_s" -gt 0 ] 2>/dev/null; then
   log_info "Watchdog/timeout: ${TIMEOUT}"
 else
@@ -240,12 +338,8 @@ append_junit() {
   {
     printf ' <testcase classname="%s" name="%s" time="%s">\n' "Audio.Record" "$name" "$elapsed"
     case "$status" in
-      PASS)
-        :
-        ;;
-      SKIP)
-        printf ' <skipped/>\n'
-        ;;
+      PASS) : ;;
+      SKIP) printf ' <skipped/>\n' ;;
       FAIL)
         printf ' <failure message="%s">\n' "failed"
         printf '%s\n' "$safe_msg"
@@ -264,6 +358,22 @@ auto_secs_for() {
     long) echo "30s" ;;
     *) echo "5s" ;;
   esac
+}
+
+# Prefer virtual capture PCMs (PipeWire/Pulse) over raw hw: when a sound server is present
+alsa_pick_virtual_pcm() {
+  command -v arecord >/dev/null 2>&1 || return 1
+
+  pcs="$(arecord -L 2>/dev/null | sed -n 's/^[[:space:]]*\([[:alnum:]_]\+\)[[:space:]]*$/\1/p')"
+
+  for pcm in pipewire pulse default; do
+    if printf '%s\n' "$pcs" | grep -m1 -x "$pcm" >/dev/null 2>&1; then
+      printf '%s\n' "$pcm"
+      return 0
+    fi
+  done
+
+  return 1
 }
 
 # ---------------- Matrix execution ----------------
@@ -305,7 +415,11 @@ for dur in $DURATIONS; do
 
     loop_hdr="source=$SRC_CHOICE"
     if [ "$AUDIO_BACKEND" = "pipewire" ]; then
-      loop_hdr="$loop_hdr($SRC_ID)"
+      if [ -n "$SRC_ID" ]; then
+        loop_hdr="$loop_hdr($SRC_ID)"
+      else
+        loop_hdr="$loop_hdr(default)"
+      fi
     else
       loop_hdr="$loop_hdr($SRC_LABEL)"
     fi
@@ -321,48 +435,101 @@ for dur in $DURATIONS; do
       log_info "[$case_name] exec: pw-record -v \"$out\""
       audio_exec_with_timeout "$effective_timeout" pw-record -v "$out" >> "$logf" 2>&1
       rc=$?
-
       bytes="$(stat -c '%s' "$out" 2>/dev/null || wc -c < "$out")"
 
-      if [ "$rc" -ne 0 ] && [ "${bytes:-0}" -gt 1024 ] 2>/dev/null; then
-        log_warn "[$case_name] nonzero rc=$rc but recording looks valid (bytes=$bytes) - PASS"
-        rc=0
+      # If we already got real audio, accept and skip fallbacks
+      if [ "${bytes:-0}" -gt 1024 ] 2>/dev/null; then
+        if [ "$rc" -ne 0 ]; then
+          log_warn "[$case_name] nonzero rc=$rc but recording looks valid (bytes=$bytes) - PASS"
+          rc=0
+        fi
+      else
+        # Only if output is tiny/empty do we try a virtual PCM (pipewire/pulse/default)
+        if command -v arecord >/dev/null 2>&1; then
+          pcm="$(alsa_pick_virtual_pcm || true)"
+          if [ -n "$pcm" ]; then
+            secs_int="$(audio_parse_secs "$secs" 2>/dev/null || echo 0)"; [ -z "$secs_int" ] && secs_int=0
+            : > "$out"
+            log_info "[$case_name] fallback: arecord -D $pcm -f S16_LE -r 48000 -c 2 -d $secs_int \"$out\""
+            audio_exec_with_timeout "$effective_timeout" \
+              arecord -D "$pcm" -f S16_LE -r 48000 -c 2 -d "$secs_int" "$out" >> "$logf" 2>&1
+            rc=$?
+            bytes="$(stat -c '%s' "$out" 2>/dev/null || wc -c < "$out")"
+          fi
+        fi
+
+        # As a last resort, retry pw-record with --target (only if we have a source id)
+        if { [ "$rc" -ne 0 ] || [ "${bytes:-0}" -le 1024 ] 2>/dev/null; } && [ -n "$SRC_ID" ]; then
+          : > "$out"
+          log_info "[$case_name] exec: pw-record -v --target \"$SRC_ID\" \"$out\""
+          audio_exec_with_timeout "$effective_timeout" pw-record -v --target "$SRC_ID" "$out" >> "$logf" 2>&1
+          rc=$?
+          bytes="$(stat -c '%s' "$out" 2>/dev/null || wc -c < "$out")"
+        fi
       fi
 
-      if [ "$rc" -ne 0 ] && [ "${bytes:-0}" -le 1024 ] 2>/dev/null; then
-        log_warn "[$case_name] first attempt rc=$rc bytes=$bytes; retry with --target $SRC_ID"
-        : > "$out"
-        log_info "[$case_name] exec: pw-record -v --target \"$SRC_ID\" \"$out\""
-        audio_exec_with_timeout "$effective_timeout" pw-record -v --target "$SRC_ID" "$out" >> "$logf" 2>&1
+      # (Optional safety) If nonzero rc but output is clearly valid, accept.
+      if [ "$rc" -ne 0 ] && [ "${bytes:-0}" -gt 1024 ] 2>/dev/null; then
+        log_warn "[$case_name] nonzero rc==$rc but recording looks valid (bytes=$bytes) - PASS"
+        rc=0
+      fi
+    else
+      if [ "$AUDIO_BACKEND" = "alsa" ]; then
+        secs_int="$(audio_parse_secs "$secs" 2>/dev/null || echo 0)"
+        [ -z "$secs_int" ] && secs_int=0
+        log_info "[$case_name] exec: arecord -D \"$SRC_ID\" -f S16_LE -r 48000 -c 2 -d $secs_int \"$out\""
+        audio_exec_with_timeout "$effective_timeout" \
+          arecord -D "$SRC_ID" -f S16_LE -r 48000 -c 2 -d "$secs_int" "$out" >> "$logf" 2>&1
+        rc=$?
+        bytes="$(stat -c '%s' "$out" 2>/dev/null || wc -c < "$out")"
+
+        if [ "$rc" -ne 0 ] || [ "${bytes:-0}" -le 1024 ] 2>/dev/null; then
+          if printf '%s\n' "$SRC_ID" | grep -q '^hw:'; then
+            alt_dev="plughw:${SRC_ID#hw:}"
+          else
+            alt_dev="$SRC_ID"
+          fi
+          for combo in "S16_LE 48000 2" "S16_LE 44100 2" "S16_LE 16000 1"; do
+            fmt=$(printf '%s\n' "$combo" | awk '{print $1}')
+            rate=$(printf '%s\n' "$combo" | awk '{print $2}')
+            ch=$(printf '%s\n' "$combo" | awk '{print $3}')
+            [ -z "$fmt" ] || [ -z "$rate" ] || [ -z "$ch" ] && continue
+            : > "$out"
+            log_info "[$case_name] retry: arecord -D \"$alt_dev\" -f $fmt -r $rate -c $ch -d $secs_int \"$out\""
+            audio_exec_with_timeout "$effective_timeout" \
+              arecord -D "$alt_dev" -f "$fmt" -r "$rate" -c "$ch" -d "$secs_int" "$out" >> "$logf" 2>&1
+            rc=$?
+            bytes="$(stat -c '%s' "$out" 2>/dev/null || wc -c < "$out")"
+            if [ "$rc" -eq 0 ] && [ "${bytes:-0}" -gt 1024 ] 2>/dev/null; then
+              break
+            fi
+          done
+        fi
+
+        if [ "$rc" -ne 0 ] && [ "${bytes:-0}" -gt 1024 ] 2>/dev/null; then
+          log_warn "[$case_name] nonzero rc=$rc but recording looks valid (bytes=$bytes) - PASS"
+          rc=0
+        fi
+      else
+        log_info "[$case_name] exec: parecord --file-format=wav \"$out\""
+        audio_exec_with_timeout "$effective_timeout" parecord --file-format=wav "$out" >> "$logf" 2>&1
         rc=$?
         bytes="$(stat -c '%s' "$out" 2>/dev/null || wc -c < "$out")"
         if [ "$rc" -ne 0 ] && [ "${bytes:-0}" -gt 1024 ] 2>/dev/null; then
-          log_warn "[$case_name] nonzero rc=$rc after retry but recording looks valid (bytes=$bytes) - PASS"
+          log_warn "[$case_name] nonzero rc=$rc but recording looks valid (bytes=$bytes) - PASS"
           rc=0
         fi
-      fi
-    else
-      log_info "[$case_name] exec: parecord --file-format=wav \"$out\""
-      audio_exec_with_timeout "$effective_timeout" parecord --file-format=wav "$out" >> "$logf" 2>&1
-      rc=$?
-      bytes="$(stat -c '%s' "$out" 2>/dev/null || wc -c < "$out")"
-      if [ "$rc" -ne 0 ] && [ "${bytes:-0}" -gt 1024 ] 2>/dev/null; then
-        log_warn "[$case_name] nonzero rc=$rc but recording looks valid (bytes=$bytes) - PASS"
-        rc=0
       fi
     fi
 
     end_s="$(date +%s 2>/dev/null || echo 0)"
     last_elapsed=$((end_s - start_s))
-    if [ "$last_elapsed" -lt 0 ]; then
-      last_elapsed=0
-    fi
+    [ "$last_elapsed" -lt 0 ] && last_elapsed=0
 
     # Evidence
     pw_ev=$(audio_evidence_pw_streaming || echo 0)
     pa_ev=$(audio_evidence_pa_streaming || echo 0)
 
-    # ---- minimal PulseAudio fallback so pa_streaming doesn't read as 0 after teardown ----
     if [ "$AUDIO_BACKEND" = "pulseaudio" ] && [ "$pa_ev" -eq 0 ]; then
       if [ "$rc" -eq 0 ] && [ "${bytes:-0}" -gt 1024 ] 2>/dev/null; then
         pa_ev=1
@@ -376,7 +543,6 @@ for dur in $DURATIONS; do
       pwlog_ev=0
     fi
 
-    # Fast teardown fallback: if user-space stream was active, trust ALSA/ASoC too.
     if [ "$alsa_ev" -eq 0 ]; then
       if [ "$AUDIO_BACKEND" = "pipewire" ] && [ "$pw_ev" -eq 1 ]; then
         alsa_ev=1
@@ -392,7 +558,6 @@ for dur in $DURATIONS; do
 
     log_info "[$case_name] evidence: pw_streaming=$pw_ev pa_streaming=$pa_ev alsa_running=$alsa_ev asoc_path_on=$asoc_ev bytes=${bytes:-0} pw_log=$pwlog_ev"
 
-    # Final PASS/FAIL
     if [ "$rc" -eq 0 ] && [ "${bytes:-0}" -gt 1024 ] 2>/dev/null; then
       log_pass "[$case_name] loop $i OK (rc=0, ${last_elapsed}s, bytes=$bytes)"
       ok_runs=$((ok_runs + 1))
