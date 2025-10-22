@@ -262,7 +262,11 @@ pa_default_source() {
   printf '%s\n' "$s"
 }
 
-pa_set_default_source() { [ -n "$1" ] && pactl set-default-source "$1" >/dev/null 2>&1 || true; }
+pa_set_default_source() {
+  if [ -n "$1" ]; then
+    pactl set-default-source "$1" >/dev/null 2>&1 || true
+  fi
+}
 
 pa_source_name() {
   id="$1"; [ -n "$id" ] || return 1
@@ -596,4 +600,64 @@ audio_exec_with_timeout() {
   # no timeout
   "$@"
 }
- 
+
+# --------------------------------------------------------------------
+# Backend chain + minimal ALSA capture picker (for fallback in run.sh)
+# --------------------------------------------------------------------
+
+# Prefer: currently selected (or detected) backend, then pipewire, pulseaudio, alsa.
+# We keep it simple: we don't filter by daemon state here; the caller tries each.
+build_backend_chain() {
+  preferred="${AUDIO_BACKEND:-$(detect_audio_backend)}"
+  chain=""
+  add_unique() {
+    case " $chain " in
+      *" $1 "*) : ;;
+      *) chain="${chain:+$chain }$1" ;;
+    esac
+  }
+  [ -n "$preferred" ] && add_unique "$preferred"
+  for b in pipewire pulseaudio alsa; do
+    add_unique "$b"
+  done
+  printf '%s\n' "$chain"
+}
+
+# Pick a plausible ALSA capture device.
+# Returns something like hw:0,0 if available, else "default".
+alsa_pick_capture() {
+  line="$(arecord -l 2>/dev/null | sed -n 's/^card \([0-9][0-9]*\):.*device \([0-9][0-9]*\):.*/\1 \2/p' | head -n1)"
+  if [ -n "$line" ]; then
+    set -- "$line"
+    printf 'hw:%s,%s\n' "$1" "$2"
+    return 0
+  fi
+  printf '%s\n' "default"
+  return 0
+}
+
+alsa_pick_capture() {
+  command -v arecord >/dev/null 2>&1 || return 1
+  # Prefer the first real capture device from `arecord -l`
+  arecord -l 2>/dev/null | awk '
+    /card [0-9]+: .*device [0-9]+:/ {
+      if (match($0, /card ([0-9]+):/, c) && match($0, /device ([0-9]+):/, d)) {
+        printf("hw:%s,%s\n", c[1], d[1]);
+        exit 0;
+      }
+    }
+  '
+}
+
+# Prefer virtual capture PCMs (PipeWire/Pulse) over raw hw: when a sound server is present
+alsa_pick_virtual_pcm() {
+  command -v arecord >/dev/null 2>&1 || return 1
+  pcs="$(arecord -L 2>/dev/null | sed -n 's/^[[:space:]]*\([[:alnum:]_]\+\)[[:space:]]*$/\1/p')"
+  for pcm in pipewire pulse default; do
+    if printf '%s\n' "$pcs" | grep -m1 -x "$pcm" >/dev/null 2>&1; then
+      printf '%s\n' "$pcm"
+      return 0
+    fi
+  done
+  return 1
+}
