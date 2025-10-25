@@ -2843,94 +2843,93 @@ wait_for_path() {
     return 1
 }
 
-# Skip unwanted device tree node names during DT parsing (e.g., aliases, metadata).
-# Used to avoid traversing irrelevant or special nodes in recursive scans.
-dt_should_skip_node() {
-    case "$1" in
-        ''|__*|phandle|name|'#'*|aliases|chosen|reserved-memory|interrupt-controller|thermal-zones)
-            return 0 ;;
-    esac
-    return 1
-}
+# ---------------------------------------------------------------------
+# Ultra-light DT matchers (no indexing; BusyBox-safe; O(first hit))
+# ---------------------------------------------------------------------
+DT_ROOT="/proc/device-tree"
 
-# Recursively yield all directories (nodes) under a DT root path.
-# Terminates early if a match result is found in the provided file.
-dt_yield_node_paths() {
-    _root="$1"
-    _matchresult="$2"
-    # If we've already matched, stop recursion immediately!
-    [ -s "$_matchresult" ] && return
-    for entry in "$_root"/*; do
-        [ -d "$entry" ] || continue
-        [ -s "$_matchresult" ] && return
-        echo "$entry"
-        dt_yield_node_paths "$entry" "$_matchresult"
-    done
-}
-
-# Recursively search for files named "compatible" in DT paths.
-# Terminates early if a match result is already present.
-dt_yield_compatible_files() {
-    _root="$1"
-    _matchresult="$2"
-    [ -s "$_matchresult" ] && return
-    for entry in "$_root"/*; do
-        [ -e "$entry" ] || continue
-        [ -s "$_matchresult" ] && return
-        if [ -f "$entry" ] && [ "$(basename "$entry")" = "compatible" ]; then
-            echo "$entry"
-        elif [ -d "$entry" ]; then
-            dt_yield_compatible_files "$entry" "$_matchresult"
-        fi
-    done
-}
-
-# Searches /proc/device-tree for nodes or compatible strings matching input patterns.
-# Returns success and matched path if any pattern is found; used in pre-test validation.
-dt_confirm_node_or_compatible() {
-    root="/proc/device-tree"
-    matchflag=$(mktemp) || exit 1
-    matchresult=$(mktemp) || { rm -f "$matchflag"; exit 1; }
+# Print matches for EVERY pattern given; return 0 if any matched, else 1.
+# Output format (unchanged):
+#  - node name match:      "<pattern>: ./path/to/node"
+#  - compatible file match:"<pattern>: ./path/to/compatible:vendor,chip[,...]"
+dt_confirm_node_or_compatible_all() {
+    LC_ALL=C
+    any=0
 
     for pattern in "$@"; do
-        # Node search: strict prefix (e.g., "isp" only matches "isp@...")
-        for entry in $(dt_yield_node_paths "$root" "$matchresult"); do
-            [ -s "$matchresult" ] && break
-            node=$(basename "$entry")
-            dt_should_skip_node "$node" && continue
-            printf '%s' "$node" | grep -iEq "^${pattern}(@|$)" || continue
-            log_info "[DTFIND] Node name strict prefix match: $entry (pattern: $pattern)"
-            if [ ! -s "$matchresult" ]; then
-                echo "${pattern}:${entry}" > "$matchresult"
-            fi
-            touch "$matchflag"
-        done
-        [ -s "$matchresult" ] && break
+        pl=$(printf '%s' "$pattern" | tr '[:upper:]' '[:lower:]')
 
-        # Compatible property search: strict (prefix or whole word)
-        for file in $(dt_yield_compatible_files "$root" "$matchresult"); do
-            [ -s "$matchresult" ] && break
-            compdir=$(dirname "$file")
-            node=$(basename "$compdir")
-            dt_should_skip_node "$node" && continue
-            compval=$(tr '\0' ' ' < "$file")
-            printf '%s' "$compval" | grep -iEq "(^|[ ,])${pattern}([ ,]|$)" || continue
-            log_info "[DTFIND] Compatible strict match: $file (${compval}) (pattern: $pattern)"
-            if [ ! -s "$matchresult" ]; then
-                echo "${pattern}:${file}" > "$matchresult"
+        # -------- Pass 1: node name strict match (^pat(@|$)) in .../name files --------
+        # BusyBox grep: -r (recursive), -s (quiet errors), -i (CI), -a (treat binary as text),
+        # -E (ERE), -l (print file names), -m1 (stop after first match).
+        name_file="$(grep -r -s -i -a -E -l -m1 "^${pl}(@|$)" "$DT_ROOT" 2>/dev/null | grep '/name$' -m1 || true)"
+        if [ -n "$name_file" ]; then
+            rel="${name_file#"$DT_ROOT"/}"
+            rel="${rel%/name}"
+            log_info "[DTFIND] Node name strict match: /$rel (pattern: $pattern)"
+            printf '%s: ./%s\n' "$pattern" "$rel"
+            any=1
+            continue
+        fi
+
+        # -------- Pass 2: compatible matches --------
+        # Heuristic:
+        #   - If pattern has a comma (e.g. "sony,imx577"), treat it as a full vendor:part token.
+        #     We just need the first compatible file that contains that exact substring.
+        #   - Else (e.g. "isp", "cam", "camss"), treat as IP family:
+        #       token == pat    OR  token ends with -pat   OR  token prefix pat
+        #     We still find a small candidate set via grep and vet tokens precisely.
+        case "$pattern" in *,*)
+            # label as chip (the part after the last comma) to avoid "swapped" look
+            chip_label="${pattern##*,}"
+            comp_file="$(grep -r -s -i -F -l -m1 -- "$pattern" "$DT_ROOT" 2>/dev/null | grep '/compatible$' -m1 || true)"
+            if [ -n "$comp_file" ]; then
+                comp_print="$(tr '\0' ' ' <"$comp_file" 2>/dev/null)"
+                comp_csv="$(tr '\0' ',' <"$comp_file" 2>/dev/null)"; comp_csv="${comp_csv%,}"
+                rel="${comp_file#"$DT_ROOT"/}"
+                log_info "[DTFIND] Compatible strict match: /$rel (${comp_print}) (pattern: $pattern)"
+                # Label by chip (e.g., "imx577: ./…:sony,imx577")
+                printf '%s: ./%s:%s\n' "$chip_label" "$rel" "$comp_csv"
+                any=1
+                continue
             fi
-            touch "$matchflag"
-        done
-        [ -s "$matchresult" ] && break
+            ;;
+        *)
+            cand_list="$(grep -r -s -i -F -l -- "$pattern" "$DT_ROOT" 2>/dev/null | grep '/compatible$' | head -n 64 || true)"
+            if [ -n "$cand_list" ]; then
+                for comp_file in $cand_list; do
+                    hit=0
+                    while IFS= read -r tok; do
+                        tokl=$(printf '%s' "$tok" | tr '[:upper:]' '[:lower:]')
+                        case "$tokl" in
+                            "$pl"|*-"$pl"|"$pl"*) hit=1; break ;;
+                        esac
+                    done <<EOF
+$(tr '\0' '\n' <"$comp_file" 2>/dev/null)
+EOF
+                    if [ "$hit" -eq 1 ]; then
+                        comp_print="$(tr '\0' ' ' <"$comp_file" 2>/dev/null)"
+                        comp_csv="$(tr '\0' ',' <"$comp_file" 2>/dev/null)"; comp_csv="${comp_csv%,}"
+                        rel="${comp_file#"$DT_ROOT"/}"
+                        log_info "[DTFIND] Compatible strict match: /$rel (${comp_print}) (pattern: $pattern)"
+                        # Label stays as the generic pattern (isp/cam/camss)
+                        printf '%s: ./%s:%s\n' "$pattern" "$rel" "$comp_csv"
+                        any=1
+                        break
+                    fi
+                done
+            fi
+            ;;
+        esac
+        # if neither pass matched, we stay silent for this pattern
     done
 
-    if [ -f "$matchflag" ] && [ -s "$matchresult" ]; then
-        cat "$matchresult"
-        rm -f "$matchflag" "$matchresult"
-        return 0
-    fi
-    rm -f "$matchflag" "$matchresult"
-    return 1
+    [ "$any" -eq 1 ]
+}
+
+# Back-compat: single-pattern wrapper
+dt_confirm_node_or_compatible() {
+    dt_confirm_node_or_compatible_all "$@"
 }
 
 # Detects and returns the first available media node (e.g., /dev/media0).
