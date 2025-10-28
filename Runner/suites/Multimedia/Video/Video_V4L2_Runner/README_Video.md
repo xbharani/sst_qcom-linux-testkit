@@ -37,6 +37,16 @@ The suite includes a **reboot-free video stack switcher** (upstream ↔ downstre
 - **CLI parity**  
   `--stack both` is supported to run the suite twice in one invocation (BASE/upstream pass then OVERLAY/downstream pass).
 
+- **NEW (opt‑in) custom module sources**  
+  You can now point the runner at alternative module locations without disturbing the default flow. If you **do nothing**, behavior is unchanged.  
+  - `--ko-dir DIR[:DIR2:...]` — search these dir(s) for `.ko*` files when resolving modules.  
+  - `--ko-tree ROOT` — use `modprobe -d ROOT` (expects `ROOT/lib/modules/$(uname -r)`).  
+  - `--ko-tar FILE.tar[.gz|.xz|.zst]` — unpack once under `/run/iris_mods/$KVER`; auto-derives a `--ko-tree` or `--ko-dir`.  
+  - `--ko-prefer-custom` — prefer custom sources before the system tree.  
+  - The loader now logs **path resolution** and **load method** lines, e.g.:  
+    - `resolve-path: qcom_iris via KO_DIRS => /data/kos/qcom_iris.ko`  
+    - `load-path: modprobe(system): qcom_iris` / `load-path: insmod: /tmp/qcom_iris.ko`
+
 ---
 
 ## Features
@@ -53,6 +63,7 @@ The suite includes a **reboot-free video stack switcher** (upstream ↔ downstre
 - **Kodiak firmware live swap** with backup/restore helpers
 - **udev refresh + prune** of stale device nodes
 - **Waits/retries/sleeps** integrated across networking, downloads, module ops, and app launches (see next section)
+- **(Opt‑in)** custom module sources with **non-exported** CLI flags (`--ko-*`); defaults remain untouched
 
 ---
 
@@ -68,8 +79,8 @@ These are **environment variables** (not user‑visible CLI flags) so your LAVA 
 | `VIDEO_APP_LAUNCH_SLEEP` | `1` | Sleep (seconds) right before launching `iris_v4l2_test` for each case. |
 | `VIDEO_INTER_TEST_SLEEP` | `1` | Sleep (seconds) between cases to allow device/udev to settle. |
 
-> Notes
-> - If download **stalls** or the system clock is invalid for TLS, the runner re-checks network health and treats it as **offline** → decode cases **SKIP** (not FAIL).
+> Notes  
+> - If download **stalls** or the system clock is invalid for TLS, the runner re-checks network health and treats it as **offline** → decode cases **SKIP** (not FAIL).  
 > - Module management includes small internal waits (e.g., `modprobe -r` retry after 200ms, 1s delays around remoteproc/module reloads). These are built‑in, no extra env required.
 
 ---
@@ -138,6 +149,12 @@ cd <target_path>/Runner
 | `--stack auto|upstream|downstream|base|overlay|up|down|both` | Select target stack (use `both` for BASE→OVERLAY two-pass) |
 | `--platform lemans|monaco|kodiak` | Force platform (else auto-detect) |
 | `--downstream-fw PATH` | **Kodiak**: path to DS firmware (e.g. `vpu20_1v.mbn`) |
+| `--ko-dir DIR[:DIR2:...]` | *(Opt‑in)* Additional directories to search for `.ko*` files during resolution |
+| `--ko-tree ROOT` | *(Opt‑in)* Use `modprobe -d ROOT` (expects `ROOT/lib/modules/$(uname -r)`) |
+| `--ko-tar FILE.tar[.gz|.xz|.zst]` | *(Opt‑in)* Unpack once into `/run/iris_mods/$KVER`; auto-derives `--ko-tree` or `--ko-dir` |
+| `--ko-prefer-custom` | *(Opt‑in)* Prefer custom module sources (KO_DIRS/KO_TREE) before system |
+
+> **Default remains unchanged.** If you omit all `--ko-*` flags, the runner uses the system module tree and `modinfo`/`modprobe` resolution only.
 
 ---
 
@@ -288,6 +305,34 @@ export VIDEO_INTER_TEST_SLEEP=3
 ./run.sh --stack upstream
 ```
 
+### (Opt‑in) Use custom module sources
+**Default behavior is unchanged.** Only use these when you want to test modules from a non-system location.
+
+#### Use a prepared tree (modprobe -d)
+```sh
+./run.sh --ko-tree /opt/custom-kmods --stack upstream
+```
+
+#### Search one or more directories of loose .ko files
+```sh
+./run.sh --ko-dir /data/kos:/mnt/usb/venus_kos --stack downstream
+```
+
+#### Prefer custom before system
+```sh
+./run.sh --ko-dir /sdcard/kos --ko-prefer-custom --stack upstream
+```
+
+#### Unpack a tarball of modules and auto-wire paths
+```sh
+./run.sh --ko-tar /sdcard/iris_kmods_${KVER}.tar.xz --stack upstream
+# The runner unpacks into /run/iris_mods/$KVER and derives --ko-tree or --ko-dir.
+```
+
+> While resolving and loading modules, the runner logs lines like:
+> - `resolve-path: venus_core via KO_TREE => /run/iris_mods/6.9.0/lib/modules/6.9.0/venus_core.ko`  
+> - `load-path: insmod: /data/kos/qcom_iris.ko` or `load-path: modprobe(system): qcom_iris`
+
 ---
 
 ## Troubleshooting
@@ -305,3 +350,4 @@ export VIDEO_INTER_TEST_SLEEP=3
   Ensure time is sane (TLS), network is reachable, and provide Wi‑Fi creds via env or `ssid_list.txt`. The downloader uses BusyBox‑compatible flags with retries and a final TLS‑lenient attempt if needed. When the network remains unreachable, the runner **SKIPs** decode cases.
 
 ---
+
