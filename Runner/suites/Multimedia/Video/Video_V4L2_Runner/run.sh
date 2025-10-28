@@ -25,6 +25,7 @@ if [ -z "$INIT_ENV" ]; then
 fi
 
 # Only source once (idempotent)
+# NOTE: We intentionally **do not export** any new vars. They stay local to this shell.
 if [ -z "${__INIT_ENV_LOADED:-}" ]; then
     # shellcheck disable=SC1090
     . "$INIT_ENV"
@@ -62,6 +63,16 @@ if [ -z "${REPEAT_POLICY:-}" ]; then REPEAT_POLICY="all"; fi
 JUNIT_OUT=""
 VERBOSE="0"
 
+# --- Stabilizers (opt-in) ---
+RETRY_ON_FAIL="0" # extra attempts after a FAIL
+POST_TEST_SLEEP="0" # settle time after each case
+
+# --- Custom module source (opt-in; default is untouched) ---
+KO_DIRS="" # colon-separated list of dirs that contain .ko files
+KO_TREE="" # alt root that has lib/modules/$KVER
+KO_TARBALL="" # optional tarball that we unpack once
+KO_PREFER_CUSTOM="0" # 1 = try custom first; default 0 = system first
+
 if [ -z "${VIDEO_STACK:-}" ]; then VIDEO_STACK="auto"; fi
 if [ -z "${VIDEO_PLATFORM:-}" ]; then VIDEO_PLATFORM=""; fi
 if [ -z "${VIDEO_FW_DS:-}" ]; then VIDEO_FW_DS=""; fi
@@ -94,8 +105,15 @@ Usage: $0 [--config path.json|/path/dir] [--dir DIR] [--pattern GLOB]
           [--downstream-fw PATH] [--force]
           [--app /path/to/iris_v4l2_test]
           [--ssid SSID] [--password PASS]
+          [--ko-dir DIR[:DIR2:...]] # opt-in: search these dirs for .ko on failure
+          [--ko-tree ROOT] # opt-in: modprobe -d ROOT (expects lib/modules/\$(uname -r))
+          [--ko-tar FILE.tar[.gz|.xz]] # opt-in: unpack once under /run/iris_mods/\$KVER, set --ko-tree/--ko-dir accordingly
+          [--ko-prefer-custom] # opt-in: try custom sources before system
           [--app-launch-sleep S] [--inter-test-sleep S]
           [--log-flavor NAME] # internal: e.g. upstream or downstream (used by --stack both)
+          # --- Stabilizers ---
+          [--retry-on-fail N] # retry up to N times if a case ends FAIL
+          [--post-test-sleep S] # sleep S seconds after each case
 EOF
 }
 
@@ -190,6 +208,22 @@ while [ $# -gt 0 ]; do
             shift
             PASSWORD="$1"
             ;;
+        --ko-dir)
+            shift
+            KO_DIRS="$1"
+            ;;
+        --ko-tree)
+            shift
+            KO_TREE="$1"
+            ;;
+        --ko-tar)
+            shift
+            KO_TARBALL="$1"
+            ;;
+        --ko-prefer-custom)
+            KO_PREFER_CUSTOM="1"
+            ;;
+
         --app-launch-sleep)
             shift
             APP_LAUNCH_SLEEP="$1"
@@ -201,6 +235,15 @@ while [ $# -gt 0 ]; do
         --log-flavor)
             shift
             LOG_FLAVOR="$1"
+            ;;
+        # --- Stabilizers ---
+        --retry-on-fail)
+            shift
+            RETRY_ON_FAIL="$1"
+            ;;
+        --post-test-sleep)
+            shift
+            POST_TEST_SLEEP="$1"
             ;;
         --help|-h)
             usage
@@ -234,6 +277,44 @@ export INTER_TEST_SLEEP
 # --- EARLY dependency check (bail out fast) ---
 
 # Ensure the app is executable if a path was provided but lacks +x
+
+# --- Optional: unpack a custom module tarball **once** (no env exports) ---
+KVER="$(uname -r 2>/dev/null || printf '%s' unknown)"
+if [ -n "$KO_TARBALL" ] && [ -f "$KO_TARBALL" ]; then
+    DEST="/run/iris_mods/$KVER"
+    if [ ! -d "$DEST" ]; then
+        mkdir -p "$DEST" 2>/dev/null || true
+        case "$KO_TARBALL" in
+            *.tar|*.tar.gz|*.tgz|*.tar.xz|*.txz|*.tar.zst)
+                if command -v tar >/dev/null 2>&1; then
+                    # best-effort; keep extraction bounded to DEST
+                    tar -xf "$KO_TARBALL" -C "$DEST" 2>/dev/null || true
+                fi
+                ;;
+            *)
+                # not a tar? treat as a directory if user passed one by mistake
+                :
+                ;;
+        esac
+    fi
+    # decide whether the tar contained a full tree or loose .ko’s
+    if [ -d "$DEST/lib/modules/$KVER" ]; then
+        KO_TREE="$DEST"
+    else
+        # find first dir that has at least one .ko (bounded depth)
+        first_ko_dir="$(find "$DEST" -type f -name '*.ko*' -maxdepth 3 2>/dev/null | head -n1 | xargs -r dirname)"
+        if [ -n "$first_ko_dir" ]; then
+            if [ -n "$KO_DIRS" ]; then
+                KO_DIRS="$first_ko_dir:$KO_DIRS"
+            else
+                KO_DIRS="$first_ko_dir"
+            fi
+        fi
+    fi
+    # quiet summary (only if user opted-in)
+    log_info "Custom module source prepared (tree='${KO_TREE:-none}', dirs='${KO_DIRS:-none}', prefer_custom=$KO_PREFER_CUSTOM)"
+fi
+
 if [ -n "$VIDEO_APP" ] && [ -f "$VIDEO_APP" ] && [ ! -x "$VIDEO_APP" ]; then
     chmod +x "$VIDEO_APP" 2>/dev/null || true
     if [ ! -x "$VIDEO_APP" ]; then
@@ -497,6 +578,14 @@ if [ "${VIDEO_STACK}" = "both" ]; then
             args="$args --inter-test-sleep $(printf %s "$INTER_TEST_SLEEP")"
         fi
 
+        # --- Stabilizers passthrough ---
+        if [ -n "${RETRY_ON_FAIL:-}" ]; then
+            args="$args --retry-on-fail $(printf %s "$RETRY_ON_FAIL")"
+        fi
+        if [ -n "${POST_TEST_SLEEP:-}" ]; then
+            args="$args --post-test-sleep $(printf %s "$POST_TEST_SLEEP")"
+        fi
+
         printf "%s" "$args"
     }
 
@@ -563,6 +652,15 @@ log_info "TIMEOUT=${TIMEOUT}s LOGLEVEL=$LOGLEVEL REPEAT=$REPEAT REPEAT_POLICY=$R
 log_info "APP=$VIDEO_APP"
 if [ -n "$VIDEO_FW_DS" ]; then
     log_info "Downstream FW override: $VIDEO_FW_DS"
+fi
+if [ -n "$KO_TREE$KO_DIRS$KO_TARBALL" ]; then
+    # print only when user actually provided custom sources
+    if [ -n "$KO_TREE" ]; then
+        log_info "Custom module tree (modprobe -d): $KO_TREE"
+    fi
+    if [ -n "$KO_DIRS" ]; then
+        log_info "Custom ko dir(s): $KO_DIRS (prefer_custom=$KO_PREFER_CUSTOM)"
+    fi
 fi
 if [ -n "$VIDEO_FW_BACKUP_DIR" ]; then
     log_info "FW backup override: $VIDEO_FW_BACKUP_DIR"
@@ -1019,6 +1117,38 @@ while IFS= read -r cfg; do
         fi
     fi
 
+    # (2) Retry on final failure (extra attempts outside REPEAT loop, before recording results)
+    if [ "$final" = "FAIL" ] && [ "$RETRY_ON_FAIL" -gt 0 ] 2>/dev/null; then
+        r=1
+        log_info "[$id] RETRY_ON_FAIL: up to $RETRY_ON_FAIL additional attempt(s)"
+        while [ "$r" -le "$RETRY_ON_FAIL" ]; do
+            # optional delay between retries, reuse REPEAT_DELAY for consistency
+            if [ "$REPEAT_DELAY" -gt 0 ] 2>/dev/null; then
+                sleep "$REPEAT_DELAY"
+            fi
+
+            log_info "[$id] retry attempt $r/$RETRY_ON_FAIL"
+            if video_run_once "$cfg" "$logf" "$TIMEOUT" "$SUCCESS_RE" "$LOGLEVEL"; then
+                pass_runs=$((pass_runs + 1))
+                final="PASS"
+                log_pass "[$id] RETRY succeeded — marking PASS"
+                break
+            else
+                # capture latest rc marker for visibility
+                rc_val="$(awk -F'=' '/^END-RUN rc=/{print $2}' "$logf" 2>/dev/null | tail -n1 | tr -d ' ')"
+                if [ -n "$rc_val" ]; then
+                    case "$rc_val" in
+                        139) log_warn "[$id] Retry exited rc=139 (SIGSEGV)." ;;
+                        134) log_warn "[$id] Retry exited rc=134 (SIGABRT)." ;;
+                        137) log_warn "[$id] Retry exited rc=137 (SIGKILL/OOM?)." ;;
+                        *) : ;;
+                    esac
+                fi
+            fi
+            r=$((r + 1))
+        done
+    fi
+
     {
         printf 'RESULT id=%s mode=%s pretty="%s" final=%s pass_runs=%s fail_runs=%s elapsed=%s\n' \
             "$id" "$mode" "$pretty" "$final" "$pass_runs" "$fail_runs" "$elapsed"
@@ -1051,6 +1181,15 @@ while IFS= read -r cfg; do
             break
         fi
     fi
+
+    # (6) Post-test settle sleep
+    case "$POST_TEST_SLEEP" in
+        ''|*[!0-9]* )
+            :
+            ;;
+        0) : ;;
+        *) log_info "Post-test sleep ${POST_TEST_SLEEP}s"; sleep "$POST_TEST_SLEEP" ;;
+    esac
 
     if [ "$MAX" -gt 0 ] && [ "$total" -ge "$MAX" ]; then
         log_info "Reached MAX=$MAX tests; stopping"
