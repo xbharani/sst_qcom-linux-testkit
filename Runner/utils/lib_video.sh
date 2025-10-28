@@ -26,6 +26,12 @@ VENUS_ENC_MOD="venus_enc"
 # Session-only blocks live under /run/modprobe.d
 RUNTIME_BLOCK_DIR="/run/modprobe.d"
 
+# Optional custom module sources (set by run.sh only when user opts in)
+# NOTE: Leaving these unset keeps the exact existing behavior.
+KO_DIRS="${KO_DIRS:-}" # colon-separated dirs containing .ko files
+KO_TREE="${KO_TREE:-}" # alt root containing lib/modules/$(uname -r)
+KO_PREFER_CUSTOM="${KO_PREFER_CUSTOM:-0}" # 1 = prefer KO_DIRS before system tree
+
 # Firmware path for Kodiak downstream blob
 FW_PATH_KODIAK="/lib/firmware/qcom/vpu/vpu20_p1_gen2.mbn"
 : "${FW_BACKUP_DIR:=/opt}"
@@ -132,12 +138,21 @@ video_insmod_with_deps() {
         if ! "$MODPROBE" -q "$d" 2>/dev/null; then
             dpath="$(video_find_module_file "$d")" || dpath=""
             if [ -n "$dpath" ] && [ -f "$dpath" ]; then
-                insmod "$dpath" 2>/dev/null || true
+                if insmod "$dpath" 2>/dev/null; then
+                    video_log_load_success "$d" dep-insmod "$dpath"
+                else
+                    log_warn "dep insmod failed for $dpath"
+                fi
+            else
+                log_warn "dep resolve failed for $d"
             fi
+        else
+            video_log_load_success "$d" dep-modprobe
         fi
     done
 
     if insmod "$path" 2>/dev/null; then
+        video_log_load_success "$m" insmod "$path"
         return 0
     fi
 
@@ -171,6 +186,9 @@ video_list_runtime_blocks() {
     fi
 }
 
+# -------------------------------------------------------------------------
+# Path resolution & load logging helpers
+# -------------------------------------------------------------------------
 video_dump_stack_state() {
     when="$1" # pre|post
 
@@ -188,44 +206,149 @@ video_dump_stack_state() {
     video_list_runtime_blocks
 }
 
+video_log_resolve() {
+    # usage: video_log_resolve <module> <how> <path>
+    # how: modinfo | system-tree | updates-tree | altroot-tree | ko-dir
+    m="$1"; how="$2"; p="$3"
+    case "$how" in
+        modinfo)
+            log_info "resolve-path: $m via modinfo -n => $p"
+            ;;
+        system-tree)
+            log_info "resolve-path: $m via /lib/modules => $p"
+            ;;
+        updates-tree)
+            log_info "resolve-path: $m via /lib/modules/*/updates => $p"
+            ;;
+        altroot-tree)
+            log_info "resolve-path: $m via KO_TREE => $p"
+            ;;
+        ko-dir)
+            log_info "resolve-path: $m via KO_DIRS => $p"
+            ;;
+    esac
+}
+
+video_log_load_success() {
+    # usage: video_log_load_success <module> <how> [extra]
+    # how: modprobe-system | modprobe-altroot | insmod | dep-modprobe | dep-insmod
+    m="$1"; how="$2"; extra="$3"
+    case "$how" in
+        modprobe-system)
+            log_info "load-path: modprobe(system): $m"
+            ;;
+        modprobe-altroot)
+            log_info "load-path: modprobe(altroot=$KO_TREE): $m"
+            ;;
+        insmod)
+            # extra = path
+            log_info "load-path: insmod: $extra"
+            ;;
+        dep-modprobe)
+            log_info "load-path(dep): modprobe(system): $m"
+            ;;
+        dep-insmod)
+            # extra = path
+            log_info "load-path(dep): insmod: $extra"
+            ;;
+    esac
+}
+
 video_find_module_file() {
     # Resolve a module file path for a logical mod name (handles _ vs -).
     # Prefers: modinfo -n, then .../updates/, then general search.
     m="$1"
     kr="$(uname -r 2>/dev/null)"
-
+ 
     if [ -z "$kr" ]; then
         kr="$(find /lib/modules -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | head -n1)"
     fi
-
+ 
     if video_exist_cmd modinfo; then
         p="$(modinfo -n "$m" 2>/dev/null)"
         if [ -n "$p" ] && [ -f "$p" ]; then
+            video_log_resolve "$m" modinfo "$p"
             printf '%s\n' "$p"
             return 0
         fi
     fi
-
+ 
     m_us="$m"
     m_hy="$(printf '%s' "$m" | tr '_' '-')"
     m_alt="$(printf '%s' "$m" | tr '-' '_')"
-
+ 
+    # Helper to scan KO_DIRS (bounded search)
+    scan_ko_dirs() {
+        modbase="$1" # without .ko*
+        if [ -z "$KO_DIRS" ]; then
+            return 1
+        fi
+        OLD_IFS="$IFS"
+        IFS=':'
+        for d in $KO_DIRS; do
+            IFS="$OLD_IFS"
+            if [ -z "$d" ] || [ ! -d "$d" ]; then
+                continue
+            fi
+            p="$(find "$d" -maxdepth 3 -type f -name "${modbase}.ko*" -print -quit 2>/dev/null)"
+            if [ -n "$p" ]; then
+                video_log_resolve "$m" ko-dir "$p"
+                printf '%s\n' "$p"
+                return 0
+            fi
+        done
+        IFS="$OLD_IFS"
+        return 1
+    }
+ 
+    # Optional order: prefer KO_DIRS first if requested
+    if [ "$KO_PREFER_CUSTOM" -eq 1 ] 2>/dev/null; then
+        for pat in "$m_us" "$m_hy" "$m_alt"; do
+            if scan_ko_dirs "$pat"; then
+                return 0
+            fi
+        done
+    fi
+ 
+    # Optional altroot tree (KO_TREE) first, if provided
+    if [ -n "$KO_TREE" ] && [ -d "$KO_TREE" ]; then
+        for pat in "$m_us" "$m_hy" "$m_alt"; do
+            p="$(find "$KO_TREE/lib/modules/$kr" -type f -name "${pat}.ko*" -print -quit 2>/dev/null)"
+            if [ -n "$p" ]; then
+                video_log_resolve "$m" altroot-tree "$p"
+                printf '%s\n' "$p"
+                return 0
+            fi
+        done
+    fi
+ 
     for pat in "$m_us" "$m_hy" "$m_alt"; do
         p="$(find "/lib/modules/$kr/updates" -type f -name "${pat}.ko*" 2>/dev/null | head -n 1)"
         if [ -n "$p" ]; then
+            video_log_resolve "$m" updates-tree "$p"
             printf '%s\n' "$p"
             return 0
         fi
     done
-
+ 
     for pat in "$m_us" "$m_hy" "$m_alt"; do
         p="$(find "/lib/modules/$kr" -type f -name "${pat}.ko*" 2>/dev/null | head -n 1)"
         if [ -n "$p" ]; then
+            video_log_resolve "$m" system-tree "$p"
             printf '%s\n' "$p"
             return 0
         fi
     done
-
+ 
+    # If not preferred-first, still try KO_DIRS at the end
+    if [ "$KO_PREFER_CUSTOM" -ne 1 ] 2>/dev/null; then
+        for pat in "$m_us" "$m_hy" "$m_alt"; do
+            if scan_ko_dirs "$pat"; then
+                return 0
+            fi
+        done
+    fi
+ 
     return 1
 }
 
@@ -359,16 +482,24 @@ video_retry_modprobe() {
 
     while [ "$i" -lt "$n" ]; do
         i=$((i+1))
-        log_info "modprobe attempt $i/$n: $m"
 
         if video_has_module_loaded "$m"; then
             log_info "module became present before attempt $i: $m"
             return 0
         fi
 
-        if "$MODPROBE" "$m" 2>/dev/null; then
-            log_info "modprobe succeeded on attempt $i: $m"
-            return 0
+        if [ -n "$KO_TREE" ] && [ -d "$KO_TREE" ]; then
+            log_info "modprobe attempt $i/$n (altroot=$KO_TREE): $m"
+            if "$MODPROBE" -d "$KO_TREE" "$m" 2>/dev/null; then
+                video_log_load_success "$m" modprobe-altroot
+                return 0
+            fi
+        else
+            log_info "modprobe attempt $i/$n (system): $m"
+            if "$MODPROBE" "$m" 2>/dev/null; then
+                video_log_load_success "$m" modprobe-system
+                return 0
+            fi
         fi
 
         video_usleep "${MOD_RETRY_SLEEP}"
@@ -602,8 +733,8 @@ video_stack_status() {
     case "$plat" in
         lemans|monaco)
             # Upstream accepted if:
-            #   - pure upstream build: qcom_iris present and iris_vpu absent
-            #   - base+overlay build: qcom_iris and iris_vpu both present
+            # - pure upstream build: qcom_iris present and iris_vpu absent
+            # - base+overlay build: qcom_iris and iris_vpu both present
             if video_has_module_loaded qcom_iris && ! video_has_module_loaded iris_vpu; then
                 printf '%s\n' "upstream"
                 return 0
@@ -623,8 +754,8 @@ video_stack_status() {
  
         kodiak)
             # Upstream accepted if:
-            #   - Venus trio present (canonical upstream on Kodiak), OR
-            #   - pure upstream build: qcom_iris present and iris_vpu absent
+            # - Venus trio present (canonical upstream on Kodiak), OR
+            # - pure upstream build: qcom_iris present and iris_vpu absent
             if video_has_module_loaded venus_core && video_has_module_loaded venus_dec && video_has_module_loaded venus_enc; then
                 printf '%s\n' "upstream"
                 return 0
@@ -787,7 +918,7 @@ video_hot_switch_modules() {
 # Entry point: ensure desired stack
 # -----------------------------------------------------------------------------
 video_ensure_stack() {
-    want_raw="$1"  # upstream|downstream|auto|base|overlay|up|down
+    want_raw="$1" # upstream|downstream|auto|base|overlay|up|down
     plat="$2"
  
     if [ -z "$plat" ]; then
@@ -814,9 +945,9 @@ video_ensure_stack() {
     # ----------------------------------------------------------------------
     # Early no-op: if current state already equals desired, do NOT hot switch.
     # This covers:
-    #   - Build #1 (pure upstream: qcom_iris only) on lemans/monaco/kodiak
-    #   - Build #2 (base+overlay: qcom_iris + iris_vpu) when upstream is requested
-    #   - Downstream already active (e.g., iris_vpu only on lemans/monaco, or kodiak downstream)
+    # - Build #1 (pure upstream: qcom_iris only) on lemans/monaco/kodiak
+    # - Build #2 (base+overlay: qcom_iris + iris_vpu) when upstream is requested
+    # - Downstream already active (e.g., iris_vpu only on lemans/monaco, or kodiak downstream)
     # Still allow Kodiak downstream FW swap without touching modules.
     # ----------------------------------------------------------------------
     cur_state="$(video_stack_status "$plat")"
