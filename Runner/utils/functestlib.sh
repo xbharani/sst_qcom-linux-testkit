@@ -3715,7 +3715,7 @@ ensure_network_online() {
         esac
     done
 
-    # -------- Wi-Fi pass --------
+    # -------- Wi-Fi pass (with bounded retry) --------
     net_wifi=""
     if command -v get_wifi_interface >/dev/null 2>&1; then
         net_wifi="$(get_wifi_interface 2>/dev/null || echo "")"
@@ -3733,49 +3733,82 @@ ensure_network_online() {
             net_creds="$(get_wifi_credentials "" "" 2>/dev/null || true)"
         fi
 
-        if [ -n "$net_creds" ]; then
-            net_ssid="$(printf '%s\n' "$net_creds" | awk '{print $1}')"
-            net_pass="$(printf '%s\n' "$net_creds" | awk '{print $2}')"
-            log_info "[NET] ${net_wifi}: trying nmcli for SSID='${net_ssid}'"
-            if command -v wifi_connect_nmcli >/dev/null 2>&1; then
-                wifi_connect_nmcli "$net_wifi" "$net_ssid" "$net_pass" || true
+        # ---- New: retry knobs (env-overridable) ----
+        wifi_max_attempts="${NET_WIFI_RETRIES:-2}"
+        wifi_retry_delay="${NET_WIFI_RETRY_DELAY:-5}"
+        if [ -z "$wifi_max_attempts" ] || [ "$wifi_max_attempts" -lt 1 ] 2>/dev/null; then
+            wifi_max_attempts=1
+        fi
+        if [ -z "$wifi_retry_delay" ] || [ "$wifi_retry_delay" -lt 0 ] 2>/dev/null; then
+            wifi_retry_delay=0
+        fi
+
+        wifi_attempt=1
+        while [ "$wifi_attempt" -le "$wifi_max_attempts" ]; do
+            if [ "$wifi_max_attempts" -gt 1 ]; then
+                log_info "[NET] ${net_wifi}: Wi-Fi attempt ${wifi_attempt}/${wifi_max_attempts}"
             fi
 
-            # If nmcli brought us up, do NOT fall back to wpa_supplicant
-            check_network_status_rc; net_rc=$?
-            if [ "$net_rc" -ne 0 ]; then
-                log_info "[NET] ${net_wifi}: falling back to wpa_supplicant + DHCP"
-                if command -v wifi_connect_wpa_supplicant >/dev/null 2>&1; then
-                    wifi_connect_wpa_supplicant "$net_wifi" "$net_ssid" "$net_pass" || true
+            if [ -n "$net_creds" ]; then
+                net_ssid="$(printf '%s\n' "$net_creds" | awk '{print $1}')"
+                net_pass="$(printf '%s\n' "$net_creds" | awk '{print $2}')"
+                log_info "[NET] ${net_wifi}: trying nmcli for SSID='${net_ssid}'"
+                if command -v wifi_connect_nmcli >/dev/null 2>&1; then
+                    wifi_connect_nmcli "$net_wifi" "$net_ssid" "$net_pass" || true
                 fi
+
+                # If nmcli brought us up, do NOT fall back to wpa_supplicant
+                check_network_status_rc; net_rc=$?
+                if [ "$net_rc" -ne 0 ]; then
+                    log_info "[NET] ${net_wifi}: falling back to wpa_supplicant + DHCP"
+                    if command -v wifi_connect_wpa_supplicant >/dev/null 2>&1; then
+                        wifi_connect_wpa_supplicant "$net_wifi" "$net_ssid" "$net_pass" || true
+                    fi
+                    if command -v run_dhcp_client >/dev/null 2>&1; then
+                        run_dhcp_client "$net_wifi" 10 >/dev/null 2>&1 || true
+                    fi
+                fi
+            else
+                log_info "[NET] ${net_wifi}: no credentials provided → DHCP only"
                 if command -v run_dhcp_client >/dev/null 2>&1; then
                     run_dhcp_client "$net_wifi" 10 >/dev/null 2>&1 || true
                 fi
             fi
-        else
-            log_info "[NET] ${net_wifi}: no credentials provided → DHCP only"
-            if command -v run_dhcp_client >/dev/null 2>&1; then
-                run_dhcp_client "$net_wifi" 10 >/dev/null 2>&1 || true
-            fi
-        fi
 
-        net_log_iface_snapshot "$net_wifi"
-        check_network_status_rc; net_rc=$?
-        case "$net_rc" in
-            0)
-                log_pass "[NET] ${net_wifi}: internet reachable"
-                ensure_reasonable_clock || log_warn "Proceeding in limited-network mode."
-                unset net_wifi net_ifaces net_ifc net_rc net_had_any_ip net_creds net_ssid net_pass
-                return 0
-                ;;
-            2)
-                log_warn "[NET] ${net_wifi}: IP assigned but internet not reachable"
-                net_had_any_ip=1
-                ;;
-            1)
-                log_info "[NET] ${net_wifi}: still no IP after connect/DHCP attempt"
-                ;;
-        esac
+            net_log_iface_snapshot "$net_wifi"
+            check_network_status_rc; net_rc=$?
+            case "$net_rc" in
+                0)
+                    log_pass "[NET] ${net_wifi}: internet reachable"
+                    ensure_reasonable_clock || log_warn "Proceeding in limited-network mode."
+                    unset net_wifi net_ifaces net_ifc net_rc net_had_any_ip net_creds net_ssid net_pass wifi_attempt wifi_max_attempts wifi_retry_delay
+                    return 0
+                    ;;
+                2)
+                    log_warn "[NET] ${net_wifi}: IP assigned but internet not reachable"
+                    net_had_any_ip=1
+                    ;;
+                1)
+                    log_info "[NET] ${net_wifi}: still no IP after connect/DHCP attempt"
+                    ;;
+            esac
+
+            # If not last attempt, cooldown + cleanup before retry
+            if [ "$wifi_attempt" -lt "$wifi_max_attempts" ]; then
+                if command -v wifi_cleanup >/dev/null 2>&1; then
+                    wifi_cleanup "$net_wifi" || true
+                fi
+                if command -v bringup_interface >/dev/null 2>&1; then
+                    bringup_interface "$net_wifi" 2 2 || true
+                fi
+                if [ "$wifi_retry_delay" -gt 0 ] 2>/dev/null; then
+                    log_info "[NET] ${net_wifi}: retrying in ${wifi_retry_delay}s…"
+                    sleep "$wifi_retry_delay"
+                fi
+            fi
+
+            wifi_attempt=$((wifi_attempt + 1))
+        done
     fi
 
     # -------- DHCP/route/DNS fixup (udhcpc script) --------
