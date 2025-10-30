@@ -73,6 +73,10 @@ KO_TREE="" # alt root that has lib/modules/$KVER
 KO_TARBALL="" # optional tarball that we unpack once
 KO_PREFER_CUSTOM="0" # 1 = try custom first; default 0 = system first
 
+# --- Opt-in: custom media bundle tar (always honored even with --dir/--config) ---
+CLIPS_TAR="" # /path/to/clips.tar[.gz|.xz|.zst|.bz2|.tgz|.tbz2|.zip]
+CLIPS_DEST="" # optional extraction destination; defaults to cfg/dir root or testcase dir
+
 if [ -z "${VIDEO_STACK:-}" ]; then VIDEO_STACK="auto"; fi
 if [ -z "${VIDEO_PLATFORM:-}" ]; then VIDEO_PLATFORM=""; fi
 if [ -z "${VIDEO_FW_DS:-}" ]; then VIDEO_FW_DS=""; fi
@@ -114,6 +118,9 @@ Usage: $0 [--config path.json|/path/dir] [--dir DIR] [--pattern GLOB]
           # --- Stabilizers ---
           [--retry-on-fail N] # retry up to N times if a case ends FAIL
           [--post-test-sleep S] # sleep S seconds after each case
+          # --- Media bundle (opt-in, local tar) ---
+          [--clips-tar /path/to/clips.tar.gz] # extract locally even if --dir/--config is used
+          [--clips-dest DIR] # extraction destination (defaults to cfg/dir root or testcase dir)
 EOF
 }
 
@@ -244,6 +251,15 @@ while [ $# -gt 0 ]; do
         --post-test-sleep)
             shift
             POST_TEST_SLEEP="$1"
+            ;;
+        # --- Media bundle (opt-in, local tar) ---
+        --clips-tar)
+            shift
+            CLIPS_TAR="$1"
+            ;;
+        --clips-dest)
+            shift
+            CLIPS_DEST="$1"
             ;;
         --help|-h)
             usage
@@ -393,6 +409,42 @@ if [ -n "$LOG_FLAVOR" ]; then
     TOP_LEVEL_RUN="0"
 fi
 
+# --- Opt-in local media bundle extraction (honored regardless of --config/--dir) ---
+if [ -n "$CLIPS_TAR" ]; then
+    # destination resolution: explicit --clips-dest > cfg dir > --dir > testcase dir
+    clips_dest_resolved="$CLIPS_DEST"
+    if [ -z "$clips_dest_resolved" ]; then
+        if [ -n "$CFG" ] && [ -f "$CFG" ]; then
+            clips_dest_resolved="$(cd "$(dirname "$CFG")" 2>/dev/null && pwd)"
+        elif [ -n "$DIR" ] && [ -d "$DIR" ]; then
+            clips_dest_resolved="$DIR"
+        else
+            clips_dest_resolved="$test_path"
+        fi
+    fi
+    mkdir -p "$clips_dest_resolved" 2>/dev/null || true
+    video_step "" "Extract custom clips tar → $clips_dest_resolved"
+    case "$CLIPS_TAR" in
+        *.tar|*.tar.gz|*.tgz|*.tar.xz|*.txz|*.tar.zst|*.tar.bz2|*.tbz2)
+            if command -v tar >/dev/null 2>&1; then
+                tar -xf "$CLIPS_TAR" -C "$clips_dest_resolved" 2>/dev/null || true
+            else
+                log_warn "tar not available; cannot extract --clips-tar"
+            fi
+            ;;
+        *.zip)
+            if command -v unzip >/dev/null 2>&1; then
+                unzip -o "$CLIPS_TAR" -d "$clips_dest_resolved" >/dev/null 2>&1 || true
+            else
+                log_warn "unzip not available; cannot extract --clips-tar"
+            fi
+            ;;
+        *)
+            log_warn "Unrecognized archive type for --clips-tar: $CLIPS_TAR"
+            ;;
+    esac
+fi
+
 # Ensure rootfs meets minimum size (2GiB) BEFORE any downloads — only once
 if [ "$TOP_LEVEL_RUN" -eq 1 ]; then
     ensure_rootfs_min_size 2
@@ -402,7 +454,7 @@ fi
 
 # If we're going to fetch, ensure network is online first — only once
 if [ "$TOP_LEVEL_RUN" -eq 1 ]; then
-    if [ "$EXTRACT_INPUT_CLIPS" = "true" ] && [ -z "$CFG" ] && [ -z "$DIR" ]; then
+    if [ "$EXTRACT_INPUT_CLIPS" = "true" ] && [ -z "$CFG" ] && [ -z "$DIR" ] && [ -z "$CLIPS_TAR" ]; then
         net_rc=1
 
         if command -v check_network_status_rc >/dev/null 2>&1; then
@@ -442,24 +494,28 @@ fi
 # --- Optional early fetch of bundle (best-effort, ALWAYS in LOG_ROOT) — only once
 if [ "$TOP_LEVEL_RUN" -eq 1 ]; then
     if [ "$EXTRACT_INPUT_CLIPS" = "true" ] && [ -z "$CFG" ] && [ -z "$DIR" ]; then
-        video_step "" "Early bundle fetch (best-effort)"
+        if [ -n "$CLIPS_TAR" ]; then
+            log_info "Custom --clips-tar provided; skipping online early fetch."
+        else
+            video_step "" "Early bundle fetch (best-effort)"
 
-        saved_log_dir="$LOG_DIR"
-        LOG_DIR="$LOG_ROOT"
-        export LOG_DIR
+            saved_log_dir="$LOG_DIR"
+            LOG_DIR="$LOG_ROOT"
+            export LOG_DIR
 
-        if command -v check_network_status_rc >/dev/null 2>&1; then
-            if ! check_network_status_rc; then
-                log_info "Network unreachable; skipping early media bundle fetch."
+            if command -v check_network_status_rc >/dev/null 2>&1; then
+                if ! check_network_status_rc; then
+                    log_info "Network unreachable; skipping early media bundle fetch."
+                else
+                    extract_tar_from_url "$TAR_URL" || true
+                fi
             else
                 extract_tar_from_url "$TAR_URL" || true
             fi
-        else
-            extract_tar_from_url "$TAR_URL" || true
-        fi
 
-        LOG_DIR="$saved_log_dir"
-        export LOG_DIR
+            LOG_DIR="$saved_log_dir"
+            export LOG_DIR
+        fi
     else
         log_info "Skipping early bundle fetch (explicit --config/--dir provided or EXTRACT_INPUT_CLIPS=false)."
     fi
@@ -584,6 +640,16 @@ if [ "${VIDEO_STACK}" = "both" ]; then
         fi
         if [ -n "${POST_TEST_SLEEP:-}" ]; then
             args="$args --post-test-sleep $(printf %s "$POST_TEST_SLEEP")"
+        fi
+
+        # --- Media bundle passthrough ---
+        if [ -n "${CLIPS_TAR:-}" ]; then
+            esc_tar="$(printf %s "$CLIPS_TAR" | sed "s/'/'\\\\''/g")"
+            args="$args --clips-tar '$esc_tar'"
+        fi
+        if [ -n "${CLIPS_DEST:-}" ]; then
+            esc_dst="$(printf %s "$CLIPS_DEST" | sed "s/'/'\\\\''/g")"
+            args="$args --clips-dest '$esc_dst'"
         fi
 
         printf "%s" "$args"
@@ -933,53 +999,58 @@ while IFS= read -r cfg; do
 
     # Fetch only when not explicitly provided a config/dir and feature enabled
     if [ "$EXTRACT_INPUT_CLIPS" = "true" ] && [ -z "$CFG" ] && [ -z "$DIR" ]; then
-        video_step "$id" "Ensure clips present or fetch"
+        if [ -n "$CLIPS_TAR" ]; then
+            log_info "[$id] Custom --clips-tar provided; skipping online per-test fetch."
+            ce=0
+        else
+            video_step "$id" "Ensure clips present or fetch"
 
-        saved_log_dir_case="$LOG_DIR"
-        LOG_DIR="$LOG_ROOT"
-        export LOG_DIR
+            saved_log_dir_case="$LOG_DIR"
+            LOG_DIR="$LOG_ROOT"
+            export LOG_DIR
 
-        video_ensure_clips_present_or_fetch "$cfg" "$TAR_URL"
-        ce=$?
+            video_ensure_clips_present_or_fetch "$cfg" "$TAR_URL"
+            ce=$?
 
-        LOG_DIR="$saved_log_dir_case"
-        export LOG_DIR
+            LOG_DIR="$saved_log_dir_case"
+            export LOG_DIR
 
-        # Map generic download errors to "offline" if link just flapped
-        if [ "$ce" -eq 1 ] 2>/dev/null; then
-            sleep "${NET_STABILIZE_SLEEP:-5}"
+            # Map generic download errors to "offline" if link just flapped
+            if [ "$ce" -eq 1 ] 2>/dev/null; then
+                sleep "${NET_STABILIZE_SLEEP:-5}"
 
-            if command -v check_network_status_rc >/dev/null 2>&1; then
-                if ! check_network_status_rc; then
-                    ce=2
-                fi
-            elif command -v check_network_status >/dev/null 2>&1; then
-                if ! check_network_status >/dev/null 2>&1; then
-                    ce=2
+                if command -v check_network_status_rc >/dev/null 2>&1; then
+                    if ! check_network_status_rc; then
+                        ce=2
+                    fi
+                elif command -v check_network_status >/dev/null 2>&1; then
+                    if ! check_network_status >/dev/null 2>&1; then
+                        ce=2
+                    fi
                 fi
             fi
-        fi
 
-        if [ "$ce" -eq 2 ] 2>/dev/null; then
-            if [ "$mode" = "decode" ]; then
-                log_skip "[$id] SKIP - offline and clips missing (decode case)"
-                printf '%s\n' "$id SKIP $pretty" >> "$LOG_DIR/summary.txt"
-                printf '%s\n' "$mode,$id,SKIP,$pretty,0,0,0" >> "$LOG_DIR/results.csv"
-                skip=$((skip + 1))
+            if [ "$ce" -eq 2 ] 2>/dev/null; then
+                if [ "$mode" = "decode" ]; then
+                    log_skip "[$id] SKIP - offline and clips missing (decode case)"
+                    printf '%s\n' "$id SKIP $pretty" >> "$LOG_DIR/summary.txt"
+                    printf '%s\n' "$mode,$id,SKIP,$pretty,0,0,0" >> "$LOG_DIR/results.csv"
+                    skip=$((skip + 1))
+                    continue
+                fi
+            elif [ "$ce" -eq 1 ] 2>/dev/null; then
+                log_fail "[$id] FAIL - fetch/extract failed while online"
+                printf '%s\n' "$id FAIL $pretty" >> "$LOG_DIR/summary.txt"
+                printf '%s\n' "$mode,$id,FAIL,$pretty,0,0,0" >> "$LOG_DIR/results.csv"
+                fail=$((fail + 1))
+                suite_rc=1
+
+                if [ "$STOP_ON_FAIL" -eq 1 ]; then
+                    break
+                fi
+
                 continue
             fi
-        elif [ "$ce" -eq 1 ] 2>/dev/null; then
-            log_fail "[$id] FAIL - fetch/extract failed while online"
-            printf '%s\n' "$id FAIL $pretty" >> "$LOG_DIR/summary.txt"
-            printf '%s\n' "$mode,$id,FAIL,$pretty,0,0,0" >> "$LOG_DIR/results.csv"
-            fail=$((fail + 1))
-            suite_rc=1
-
-            if [ "$STOP_ON_FAIL" -eq 1 ]; then
-                break
-            fi
-
-            continue
         fi
     else
         log_info "[$id] Fetch disabled (explicit --config/--dir)."
@@ -1139,7 +1210,7 @@ while IFS= read -r cfg; do
                 if [ -n "$rc_val" ]; then
                     case "$rc_val" in
                         139) log_warn "[$id] Retry exited rc=139 (SIGSEGV)." ;;
-                        134) log_warn "[$id] Retry exited rc=134 (SIGABRT)." ;;
+                        134) log_warn "[$id] Retry exited rc=134 (SIGABORT)." ;;
                         137) log_warn "[$id] Retry exited rc=137 (SIGKILL/OOM?)." ;;
                         *) : ;;
                     esac
@@ -1263,9 +1334,11 @@ fi
 if [ "$suite_rc" -eq 0 ] 2>/dev/null; then
     log_pass "$TESTNAME: PASS"
     printf '%s\n' "$TESTNAME PASS" >"$RES_FILE"
+    exit 0
 else
     log_fail "$TESTNAME: FAIL"
     printf '%s\n' "$TESTNAME FAIL" >"$RES_FILE"
+    exit 1
 fi
 
 exit "$suite_rc"
