@@ -1,54 +1,63 @@
 metadata:
   format: Lava-Test Test Definition 1.0
-  name: Video_V4L2_With_Secrets
-  description: "Run Video V4L2 runner; use LAVA secrets for Wi-Fi; auto-args for kodiak vs lemans/monaco; run base & overlay"
+  name: Video_V4L2_LocalClips
+  description: "Run Video V4L2 runner with local clips tar and custom .ko dir; auto-args for kodiak vs lemans/monaco; run base & overlay"
   maintainer:
     - smuppand@qti.qualcomm.com
   os:
     - openembedded
   scope:
     - functional
-
 run:
   steps:
     - cd Runner
     - export REPO_ROOT="$PWD"
-    - export TARGET="${TARGET:-}" # expected values: kodiak | lemans | monaco (case-insensitive)
+    - export TARGET="${TARGET:-}" # kodiak | lemans | monaco (case-insensitive)
 
-    # Read Wi-Fi credentials from LAVA-provided secrets (exported as env vars in the job)
-    - export SSID="${LAVA_WIFI_SSID:-}"
-    - export PASSWORD="${LAVA_WIFI_PASSWORD:-}"
-
-    # Build args for run.sh based on TARGET; always pass secrets; add downstream FW only for kodiak
     - |
       RPATH="$REPO_ROOT/suites/Multimedia/Video/Video_V4L2_Runner/run.sh"
       RESFILE="$REPO_ROOT/suites/Multimedia/Video/Video_V4L2_Runner/Video_V4L2_Runner.res"
-      ARGS=""
+
+      # Custom media bundle (local) paths
+      CLIPS_TAR="/data/vendor/iris_test_app/video_clips_iris.tar.gz"
+      CLIPS_DEST="/data/vendor/iris_test_app/clips"
+
+      # Custom downstream module location (directory containing iris_vpu.ko)
+      KO_DIR="/data/vendor/iris_test_app"
+
+      # Optional: downstream firmware needed on Kodiak overlay
+      DS_FW="/data/vendor/iris_test_app/vpu20_p1_gen2.mbn"
+
+      # Normalize/derive platform flag
       TL="$(printf '%s' "${TARGET:-}" | tr '[:upper:]' '[:lower:]')"
       case "$TL" in
-        kodiak)
-          ARGS="$ARGS --platform kodiak --app /data/vendor/iris_test_app/iris_v4l2_test --ssid \"$SSID\" --password \"$PASSWORD\" --downstream-fw /data/vendor/iris_test_app/vpu20_p1_gen2.mbn"
-          ;;
-        lemans)
-          ARGS="$ARGS --platform lemans --ssid \"$SSID\" --password \"$PASSWORD\"" --app /data/vendor/iris_test_app/iris_v4l2_test
-          ;;
-        monaco)
-          ARGS="$ARGS --platform monaco --ssid \"$SSID\" --password \"$PASSWORD\"" --app /data/vendor/iris_test_app/iris_v4l2_test
-          ;;
-        *)
-          # Unknown or not provided: still pass secrets; platform autodetect in run.sh
-          ARGS="$ARGS --ssid \"$SSID\" --password \"$PASSWORD\""
-          ;;
+        kodiak|lemans|monaco) PLAT="--platform $TL" ;;
+        *) PLAT="" ;; # autodetect
       esac
-      echo "TARGET=${TARGET:-unset} ARGS=$ARGS"
 
-      # Run base (upstream) then overlay (downstream)
+      # Common args (clips local, no Wi-Fi or TAR_URL needed)
+      ARGS_COMMON="--clips-tar $CLIPS_TAR --clips-dest $CLIPS_DEST --app /data/vendor/iris_test_app/iris_v4l2_test $PLAT --retry-on-fail 2 --loglevel 15"
+
+      # --- BASE (upstream): NO ko args here ---
+      ARGS_BASE="--stack base $ARGS_COMMON"
+
+      # --- OVERLAY (downstream): add ko args; on kodiak also add downstream FW ---
+      ARGS_OVERLAY="--stack overlay $ARGS_COMMON --ko-dir $KO_DIR --ko-prefer-custom"
+      if [ "$TL" = "kodiak" ]; then
+        ARGS_OVERLAY="$ARGS_OVERLAY --downstream-fw $DS_FW"
+      fi
+
+      echo "BASE ARGS: $ARGS_BASE"
+      echo "OVERLAY ARGS: $ARGS_OVERLAY"
+
+      # Run BASE (upstream)
       # shellcheck disable=SC2086
-      sh -lc "$RPATH --stack base $ARGS" || true
+      sh -lc "$RPATH $ARGS_BASE" || true
       "$REPO_ROOT/utils/send-to-lava.sh" "$RESFILE" || true
 
+      # Run OVERLAY (downstream)
       # shellcheck disable=SC2086
-      sh -lc "$RPATH --stack overlay $ARGS" || true
+      sh -lc "$RPATH $ARGS_OVERLAY" || true
       "$REPO_ROOT/utils/send-to-lava.sh" "$RESFILE" || true
 
       # Optional roll-up (ignored if absent)
