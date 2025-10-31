@@ -293,6 +293,12 @@ export INTER_TEST_SLEEP
 # --- EARLY dependency check (bail out fast) ---
 
 # Ensure the app is executable if a path was provided but lacks +x
+if [ -n "$VIDEO_APP" ] && [ -f "$VIDEO_APP" ] && [ ! -x "$VIDEO_APP" ]; then
+    chmod +x "$VIDEO_APP" 2>/dev/null || true
+    if [ ! -x "$VIDEO_APP" ]; then
+        log_warn "App $VIDEO_APP is not executable and chmod failed; attempting to run anyway."
+    fi
+fi
 
 # --- Optional: unpack a custom module tarball **once** (no env exports) ---
 KVER="$(uname -r 2>/dev/null || printf '%s' unknown)"
@@ -308,16 +314,13 @@ if [ -n "$KO_TARBALL" ] && [ -f "$KO_TARBALL" ]; then
                 fi
                 ;;
             *)
-                # not a tar? treat as a directory if user passed one by mistake
                 :
                 ;;
         esac
     fi
-    # decide whether the tar contained a full tree or loose .ko’s
     if [ -d "$DEST/lib/modules/$KVER" ]; then
         KO_TREE="$DEST"
     else
-        # find first dir that has at least one .ko (bounded depth)
         first_ko_dir="$(find "$DEST" -type f -name '*.ko*' -maxdepth 3 2>/dev/null | head -n1 | xargs -r dirname)"
         if [ -n "$first_ko_dir" ]; then
             if [ -n "$KO_DIRS" ]; then
@@ -327,7 +330,6 @@ if [ -n "$KO_TARBALL" ] && [ -f "$KO_TARBALL" ]; then
             fi
         fi
     fi
-    # quiet summary (only if user opted-in)
     log_info "Custom module source prepared (tree='${KO_TREE:-none}', dirs='${KO_DIRS:-none}', prefer_custom=$KO_PREFER_CUSTOM)"
 fi
 
@@ -689,7 +691,7 @@ if [ "${VIDEO_STACK}" = "both" ]; then
         overlay_reason="missing --downstream-fw"
     fi
 
-    if [ "$rc_base" -eq 0 ] && [ "$rc_overlay" -eq 0 ]; then
+    if [ "$rc_base" -eq 0 ] && [ "$rc_overlay" -eq 0 ] ; then
         if [ "$base_status" = "PASS" ] && [ "$overlay_status" = "SKIP" ]; then
             if [ -n "$overlay_reason" ]; then
                 log_info "[both] upstream/base executed and PASS; downstream/overlay SKIP ($overlay_reason). Overall PASS."
@@ -720,7 +722,6 @@ if [ -n "$VIDEO_FW_DS" ]; then
     log_info "Downstream FW override: $VIDEO_FW_DS"
 fi
 if [ -n "$KO_TREE$KO_DIRS$KO_TARBALL" ]; then
-    # print only when user actually provided custom sources
     if [ -n "$KO_TREE" ]; then
         log_info "Custom module tree (modprobe -d): $KO_TREE"
     fi
@@ -776,6 +777,33 @@ fi
 # --- Optional cleanup: robust capture + normalization of post-stack value ---
 video_dump_stack_state "pre"
 
+# --- Custom .ko staging (only if user provided --ko-dir) ---
+if [ -n "${KO_DIRS:-}" ]; then
+    case "$(video_normalize_stack "$VIDEO_STACK")" in
+        downstream|overlay|down)
+            KVER="$(uname -r 2>/dev/null || printf '%s' unknown)"
+
+            if command -v video_find_module_file >/dev/null 2>&1; then
+                modpath="$(video_find_module_file iris_vpu "$KO_DIRS" 2>/dev/null | tail -n1 | tr -d '\r')"
+            else
+                modpath=""
+            fi
+
+            if [ -n "$modpath" ] && [ -f "$modpath" ]; then
+                log_info "Using custom iris_vpu candidate: $modpath"
+                if command -v video_ensure_moddir_install >/dev/null 2>&1; then
+                    video_ensure_moddir_install "$modpath" "$KVER" >/dev/null 2>&1 || true
+                fi
+                if command -v depmod >/dev/null 2>&1; then
+                    depmod -a "$KVER" >/dev/null 2>&1 || true
+                fi
+            else
+                log_warn "KO_DIRS set, but iris_vpu.ko not found under: $KO_DIRS"
+            fi
+            ;;
+    esac
+fi
+
 video_step "" "Apply desired stack = $VIDEO_STACK"
 
 stack_tmp="$LOG_DIR/.ensure_stack.$$.out"
@@ -803,6 +831,28 @@ fi
 log_info "Video stack (post): $post_stack"
 
 video_dump_stack_state "post"
+
+# --- Custom .ko load assist (only if user provided --ko-dir) ---
+if [ -n "${KO_DIRS:-}" ]; then
+    case "$(video_normalize_stack "$VIDEO_STACK")" in
+        downstream|overlay|down)
+            if ! video_has_module_loaded iris_vpu 2>/dev/null; then
+                if command -v video_find_module_file >/dev/null 2>&1; then
+                    modpath2="$(video_find_module_file iris_vpu "$KO_DIRS" 2>/dev/null | tail -n1 | tr -d '\r')"
+                else
+                    modpath2=""
+                fi
+
+                if [ "$KO_PREFER_CUSTOM" = "1" ] && [ -n "$modpath2" ] && [ -f "$modpath2" ]; then
+                    if command -v video_insmod_with_deps >/dev/null 2>&1; then
+                        log_info "Prefer custom: insmod with deps: $modpath2"
+                        video_insmod_with_deps "$modpath2" >/dev/null 2>&1 || true
+                    fi
+                fi
+            fi
+            ;;
+    esac
+fi
 
 # Always refresh/prune device nodes (even if no switch occurred)
 video_step "" "Refresh V4L device nodes (udev trigger + prune stale)"
@@ -1193,7 +1243,6 @@ while IFS= read -r cfg; do
         r=1
         log_info "[$id] RETRY_ON_FAIL: up to $RETRY_ON_FAIL additional attempt(s)"
         while [ "$r" -le "$RETRY_ON_FAIL" ]; do
-            # optional delay between retries, reuse REPEAT_DELAY for consistency
             if [ "$REPEAT_DELAY" -gt 0 ] 2>/dev/null; then
                 sleep "$REPEAT_DELAY"
             fi
@@ -1205,7 +1254,6 @@ while IFS= read -r cfg; do
                 log_pass "[$id] RETRY succeeded — marking PASS"
                 break
             else
-                # capture latest rc marker for visibility
                 rc_val="$(awk -F'=' '/^END-RUN rc=/{print $2}' "$logf" 2>/dev/null | tail -n1 | tr -d ' ')"
                 if [ -n "$rc_val" ]; then
                     case "$rc_val" in
@@ -1253,7 +1301,6 @@ while IFS= read -r cfg; do
         fi
     fi
 
-    # (6) Post-test settle sleep
     case "$POST_TEST_SLEEP" in
         ''|*[!0-9]* )
             :

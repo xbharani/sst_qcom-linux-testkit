@@ -105,58 +105,144 @@ video_log_fw_hint() {
     fi
 }
 
-# -----------------------------------------------------------------------------
-# Shared module introspection helpers (kept; used by dump)
-# -----------------------------------------------------------------------------
-video_insmod_with_deps() {
-    # Takes a logical module name (e.g. qcom_iris), resolves the path, then insmods deps+module
-    m="$1"
+# Install a module file into /lib/modules/$(uname -r)/updates and run depmod.
+# Usage: video_ensure_moddir_install <module_path> <logical_name>
+video_ensure_moddir_install() {
+    mp="$1"     # source path to .ko
+    mname="$2"  # logical module name for logging
+    kr="$(uname -r 2>/dev/null)"
+    [ -z "$kr" ] && kr="$(find /lib/modules -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | head -n 1)"
 
-    if video_has_module_loaded "$m"; then
-        log_info "module already loaded (insmod path skipped): $m"
-        return 0
-    fi
-
-    path="$(video_find_module_file "$m")" || path=""
-    if [ -z "$path" ] || [ ! -f "$path" ]; then
-        log_warn "insmod fallback: could not locate module file for $m"
+    if [ -z "$mp" ] || [ ! -f "$mp" ]; then
+        log_warn "install-ko: invalid module path: $mp"
         return 1
     fi
 
+    updates="/lib/modules/$kr/updates"
+    if [ ! -d "$updates" ]; then
+        if ! mkdir -p "$updates" 2>/dev/null; then
+            log_warn "install-ko: cannot create $updates (read-only FS?)"
+            return 1
+        fi
+    fi
+
+    base="$(basename "$mp")"
+    dst="$updates/$base"
+
+    do_copy=1
+    if [ -f "$dst" ]; then
+        if command -v md5sum >/dev/null 2>&1; then
+            src_md5="$(md5sum "$mp" 2>/dev/null | awk '{print $1}')"
+            dst_md5="$(md5sum "$dst" 2>/dev/null | awk '{print $1}')"
+            [ -n "$src_md5" ] && [ "$src_md5" = "$dst_md5" ] && do_copy=0
+        else
+            if cmp -s "$mp" "$dst" 2>/dev/null; then
+                do_copy=0
+            fi
+        fi
+    fi
+
+    if [ "$do_copy" -eq 1 ]; then
+        if ! cp -f "$mp" "$dst" 2>/dev/null; then
+            log_warn "install-ko: failed to copy $mp -> $dst"
+            return 1
+        fi
+        chmod 0644 "$dst" 2>/dev/null || true
+        sync 2>/dev/null || true
+        log_info "install-ko: copied $(basename "$mp") to $dst"
+    else
+        log_info "install-ko: up-to-date at $dst"
+    fi
+
+    if command -v depmod >/dev/null 2>&1; then
+        if depmod -a "$kr" >/dev/null 2>&1; then
+            log_info "install-ko: depmod -a $kr done"
+        else
+            log_warn "install-ko: depmod -a $kr failed (continuing)"
+        fi
+    else
+        log_warn "install-ko: depmod not found; modprobe may fail to resolve deps"
+    fi
+
+    [ -n "$mname" ] && video_log_resolve "$mname" updates-tree "$dst"
+    printf '%s\n' "$dst"
+    return 0
+}
+
+# Takes a logical module name (e.g. iris_vpu), resolves/copies into updates/, depmods, then loads deps+module.
+video_insmod_with_deps() {
+    m="$1"
+    [ -z "$m" ] && { log_warn "insmod-with-deps: empty module name"; return 1; }
+
+    [ -z "$MODPROBE" ] && MODPROBE="modprobe"
+
+    if video_has_module_loaded "$m"; then
+        log_info "module already loaded (skip): $m"
+        return 0
+    fi
+
+    mp="$(video_find_module_file "$m")" || mp=""
+    if [ -z "$mp" ] || [ ! -f "$mp" ]; then
+        log_warn "insmod fallback: could not locate module file for $m"
+        return 1
+    fi
+    log_info "resolve: $m -> $mp"
+
+    case "$mp" in
+        /lib/modules/*) staged="$mp" ;;
+        *)
+            staged="$(video_ensure_moddir_install "$mp" "$m")" || staged=""
+            if [ -z "$staged" ]; then
+                log_warn "insmod-with-deps: staging into updates/ failed for $m"
+                return 1
+            fi
+            ;;
+    esac
+
+    if "$MODPROBE" -q "$m" 2>/dev/null; then
+        video_log_load_success "$m" modprobe "$staged"
+        return 0
+    fi
+    log_warn "modprobe failed: $m (attempting direct insmod)"
+
     deps=""
     if video_exist_cmd modinfo; then
-        deps="$(modinfo -F depends "$path" 2>/dev/null | tr ',' ' ' | tr -s ' ')"
+        deps="$(modinfo -F depends "$staged" 2>/dev/null | tr ',' ' ' | tr -s ' ')"
     fi
 
     for d in $deps; do
-        if [ -z "$d" ]; then
-            continue
-        fi
+        [ -z "$d" ] && continue
         if video_has_module_loaded "$d"; then
             continue
         fi
         if ! "$MODPROBE" -q "$d" 2>/dev/null; then
             dpath="$(video_find_module_file "$d")" || dpath=""
+            if [ -z "$dpath" ] || [ ! -f "$dpath" ]; then
+                kr="$(uname -r 2>/dev/null)"
+                [ -z "$kr" ] && kr="$(find /lib/modules -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | head -n 1)"
+                cand="/lib/modules/$kr/updates/${d}.ko"
+                [ -f "$cand" ] && dpath="$cand"
+            fi
             if [ -n "$dpath" ] && [ -f "$dpath" ]; then
                 if insmod "$dpath" 2>/dev/null; then
                     video_log_load_success "$d" dep-insmod "$dpath"
                 else
-                    log_warn "dep insmod failed for $dpath"
+                    log_warn "dep insmod failed: $d ($dpath)"
                 fi
             else
-                log_warn "dep resolve failed for $d"
+                log_warn "dep resolve failed: $d"
             fi
         else
             video_log_load_success "$d" dep-modprobe
         fi
     done
 
-    if insmod "$path" 2>/dev/null; then
-        video_log_load_success "$m" insmod "$path"
+    if insmod "$staged" 2>/dev/null; then
+        video_log_load_success "$m" insmod "$staged"
         return 0
     fi
 
-    log_warn "insmod failed for $path"
+    log_warn "insmod failed for $staged"
     return 1
 }
 
@@ -256,12 +342,12 @@ video_log_load_success() {
 
 video_find_module_file() {
     # Resolve a module file path for a logical mod name (handles _ vs -).
-    # Prefers: modinfo -n, then .../updates/, then general search.
+    # Prefers: modinfo -n, then .../updates/, then general search (and KO_DIRS/KO_TREE if provided).
     m="$1"
     kr="$(uname -r 2>/dev/null)"
  
     if [ -z "$kr" ]; then
-        kr="$(find /lib/modules -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | head -n1)"
+        kr="$(find /lib/modules -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | head -n 1)"
     fi
  
     if video_exist_cmd modinfo; then
@@ -287,6 +373,7 @@ video_find_module_file() {
         IFS=':'
         for d in $KO_DIRS; do
             IFS="$OLD_IFS"
+            # SC2015 fix: avoid `[ -n "$d" ] && [ -d "$d" ] || continue`
             if [ -z "$d" ] || [ ! -d "$d" ]; then
                 continue
             fi
