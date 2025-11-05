@@ -58,41 +58,6 @@
                         "Id": "GOPSize",
                         "Vtype": "Int",
                         "Value": 59
-                    },
-                    {
-                        "Id": "MultiSliceMode",
-                        "Vtype": "String",
-                        "Value": "SINGLE"
-                    },
-                    {
-                        "Id": "MinIQP",
-                        "Vtype": "Int",
-                        "Value": 10
-                    },
-                    {
-                        "Id": "MinPQP",
-                        "Vtype": "Int",
-                        "Value": 10
-                    },
-                    {
-                        "Id": "MinBQP",
-                        "Vtype": "Int",
-                        "Value": 10
-                    },
-                    {
-                        "Id": "MaxIQP",
-                        "Vtype": "Int",
-                        "Value": 51
-                    },
-                    {
-                        "Id": "MaxPQP",
-                        "Vtype": "Int",
-                        "Value": 51
-                    },
-                    {
-                        "Id": "MaxBQP",
-                        "Vtype": "Int",
-                        "Value": 51
                     }
                 ],
                 "DynamicControls": []
